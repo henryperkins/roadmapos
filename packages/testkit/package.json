@@ -2,7 +2,9 @@
   "name": "@roadmapos/testkit",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
@@ -10,6 +12,7 @@
   },
   "dependencies": {
     "@roadmapos/db": "workspace:*",
-    "@roadmapos/domain": "workspace:*"
+    "@roadmapos/domain": "workspace:*",
+    "postgres": "^3.4.9"
   }
 }
