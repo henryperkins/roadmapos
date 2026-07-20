@@ -1,0 +1,20 @@
+{
+  "name": "@roadmapos/control-plane",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/sensible": "^6.0.4",
+    "@roadmapos/db": "workspace:*",
+    "@roadmapos/domain": "workspace:*",
+    "@roadmapos/policy": "workspace:*",
+    "fastify": "^5.10.0",
+    "zod": "^3.25.76"
+  }
+}

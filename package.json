@@ -1,0 +1,27 @@
+{
+  "name": "roadmapos",
+  "private": true,
+  "packageManager": "pnpm@10",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "vitest run --workspace vitest.workspace.ts",
+    "test:watch": "vitest --workspace vitest.workspace.ts",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint .",
+    "db:migrate": "pnpm --filter @roadmapos/db migrate",
+    "dev:control-plane": "pnpm --filter @roadmapos/control-plane dev"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^22.20.1",
+    "@vitest/coverage-v8": "^3.2.7",
+    "eslint": "^9.39.5",
+    "tsx": "^4.23.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8",
+    "vitest": "^3.2.7"
+  }
+}
