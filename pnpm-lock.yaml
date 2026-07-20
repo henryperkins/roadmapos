@@ -47,12 +47,19 @@ importers:
       '@roadmapos/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      drizzle-orm:
+        specifier: ^0.45.2
+        version: 0.45.2(postgres@3.4.9)
       fastify:
         specifier: ^5.10.0
         version: 5.10.0
       zod:
         specifier: ^3.25.76
         version: 3.25.76
+    devDependencies:
+      '@roadmapos/testkit':
+        specifier: workspace:*
+        version: link:../../packages/testkit
 
   packages/db:
     dependencies:
