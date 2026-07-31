@@ -55,8 +55,8 @@ export function reduceRunState(current: RunState, event: RunEvent, condition: Co
   if (current === "planning" && event.type === "instruction_received" && condition !== "interactive_copilot") {
     throw new Error("Invalid run transition: only interactive copilot accepts an instruction from planning");
   }
-  if (current === "executing_action" && event.type === "action_completed" && condition === "interactive_copilot") {
-    return "awaiting_instruction";
+  if (current === "executing_action" && event.type === "action_completed") {
+    return condition === "interactive_copilot" ? "awaiting_instruction" : "proposing_action";
   }
   if (current === "awaiting_escalation_approval" && event.type === "escalation_rejected" && condition === "interactive_copilot") {
     return "awaiting_instruction";

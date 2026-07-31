@@ -1,6 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 import {
   appendAuditEvent,
+  approvalCarryovers,
   approvalInvalidations,
   approvals,
   enqueueJob,
@@ -11,6 +12,7 @@ import {
   runs,
   type Database
 } from "@roadmapos/db";
+import type { Condition } from "@roadmapos/domain";
 import type { RepositoryPermission } from "@roadmapos/domain";
 import type { GitHubGateway } from "@roadmapos/github";
 import type { RepositoryPolicy } from "@roadmapos/policy";
@@ -243,5 +245,109 @@ export class ApprovalService {
       .leftJoin(approvalInvalidations, eq(approvalInvalidations.approvalId, approvals.id))
       .where(and(eq(approvals.requestType, input.requestType), eq(approvals.requestId, input.requestId), isNull(approvalInvalidations.id)));
     return { distinctEligibleApprovers: new Set(remaining.map((approval) => approval.login)).size, invalidatedLogins };
+  }
+
+  /**
+   * Counts the approvals that still authorize a plan: those recorded directly against it plus those
+   * an operator carried over from the plan it editorially superseded.
+   */
+  async revalidatePlanApprovals(input: {
+    pilotId: string;
+    runId: string;
+    planId: string;
+    installationId: string;
+    owner: string;
+    repo: string;
+    requiredRole: "write" | "maintain" | "admin";
+  }): Promise<RequestEligibility> {
+    const direct = await this.database.db.select({ id: approvals.id, login: approvals.githubLogin })
+      .from(approvals)
+      .leftJoin(approvalInvalidations, eq(approvalInvalidations.approvalId, approvals.id))
+      .where(and(eq(approvals.requestType, "execution_plan"), eq(approvals.requestId, input.planId), isNull(approvalInvalidations.id)));
+    const carried = await this.database.db.select({ id: approvals.id, login: approvals.githubLogin })
+      .from(approvalCarryovers)
+      .innerJoin(approvals, eq(approvals.id, approvalCarryovers.approvalId))
+      .leftJoin(approvalInvalidations, eq(approvalInvalidations.approvalId, approvals.id))
+      .where(and(eq(approvalCarryovers.toPlanId, input.planId), isNull(approvalInvalidations.id)));
+    const active = [...new Map([...direct, ...carried].map((approval) => [approval.id, approval])).values()];
+    const invalidatedLogins: string[] = [];
+    for (const approval of active) {
+      const current = await this.github.getRepositoryPermission({ installationId: input.installationId, owner: input.owner, repo: input.repo, login: approval.login });
+      if (meetsPermission(current, input.requiredRole)) continue;
+      const event = await appendAuditEvent(this.database, {
+        pilotId: input.pilotId, eventType: "approval.permission_lost", actorType: "system", actorId: "approval-service",
+        payload: { runId: input.runId, approvalId: approval.id, githubLogin: approval.login, requiredRole: input.requiredRole, currentPermission: current }
+      });
+      await this.database.db.insert(approvalInvalidations).values({
+        id: crypto.randomUUID(), approvalId: approval.id, reason: `Repository permission fell below ${input.requiredRole}`, invalidatedByEventId: event.id
+      }).onConflictDoNothing();
+      invalidatedLogins.push(approval.login);
+    }
+    const ineligible = new Set(invalidatedLogins);
+    return {
+      distinctEligibleApprovers: new Set(active.filter((approval) => !ineligible.has(approval.login)).map((approval) => approval.login)).size,
+      invalidatedLogins
+    };
+  }
+
+  /**
+   * The last live permission check before a repository write. If plan or escalation quorum has been
+   * lost since the approval was recorded, the frozen proposal is returned to `proposed` and the run
+   * waits for a replacement approval rather than executing on stale authority.
+   */
+  async revalidateBeforeExecution(input: { runId: string; checkpointId?: string }): Promise<void> {
+    const [record] = await this.database.db
+      .select({ run: runs, repository: repositories, policy: repositoryPolicyVersions })
+      .from(runs)
+      .innerJoin(repositories, eq(repositories.id, runs.repositoryId))
+      .innerJoin(repositoryPolicyVersions, eq(repositoryPolicyVersions.id, runs.policyVersionId))
+      .where(eq(runs.id, input.runId));
+    if (!record) throw new Error("Run not found");
+    const policy = record.policy.policyJson as RepositoryPolicy;
+    if (record.run.condition === "governed_orchestration") {
+      if (!record.run.currentPlanId) throw new Error("Governed run has no current plan");
+      const plan = await this.revalidatePlanApprovals({
+        pilotId: record.run.pilotId, runId: input.runId, planId: record.run.currentPlanId,
+        installationId: record.repository.installationId.toString(), owner: record.repository.owner, repo: record.repository.name,
+        requiredRole: policy.authorization.minimumApprovalRole
+      });
+      if (plan.distinctEligibleApprovers < policy.authorization.executionPlanQuorum) {
+        await this.database.sql`
+          UPDATE action_proposals SET status = 'proposed'
+          WHERE run_id = ${input.runId}::uuid AND status = 'authorized'
+        `;
+        if (record.run.state !== "awaiting_plan_approval") {
+          await this.execution.transition({ runId: input.runId, pilotId: record.run.pilotId, condition: "governed_orchestration", event: { type: "plan_quorum_lost" }, actorType: "system", actorId: "approval-service" });
+        }
+        throw new Error("Execution-plan approval quorum was lost; replacement approval is required");
+      }
+    }
+
+    if (!input.checkpointId) return;
+    const [approved] = await this.database.sql<{ escalation_id: string; proposal_id: string; status: string }[]>`
+      SELECT e.id AS escalation_id, c.action_proposal_id AS proposal_id, e.status
+      FROM escalations e
+      JOIN governance_checkpoints c ON c.id = e.checkpoint_id
+      WHERE e.checkpoint_id = ${input.checkpointId}::uuid
+      ORDER BY e.version DESC
+      LIMIT 1
+    `;
+    if (!approved || approved.status !== "approved") return;
+    const escalation = await this.revalidateRequestApprovals({
+      pilotId: record.run.pilotId, runId: input.runId, requestType: "escalation", requestId: approved.escalation_id,
+      installationId: record.repository.installationId.toString(), owner: record.repository.owner, repo: record.repository.name,
+      requiredRole: policy.authorization.minimumApprovalRole
+    });
+    if (escalation.distinctEligibleApprovers >= policy.authorization.escalationQuorum) return;
+
+    await this.database.sql.begin(async (transaction) => {
+      await transaction`UPDATE escalations SET status = 'awaiting_approval' WHERE id = ${approved.escalation_id}::uuid AND status = 'approved'`;
+      await transaction`UPDATE action_proposals SET status = 'proposed' WHERE id = ${approved.proposal_id}::uuid AND status = 'authorized'`;
+      await this.execution.transitionTx(transaction, {
+        runId: input.runId, pilotId: record.run.pilotId, condition: record.run.condition as Condition,
+        event: { type: "escalation_quorum_lost" }, actorType: "system", actorId: "approval-service"
+      });
+    });
+    throw new Error("Escalation approval quorum was lost; replacement approval is required");
   }
 }

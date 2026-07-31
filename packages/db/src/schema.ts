@@ -268,3 +268,13 @@ export const checkpointReveals = pgTable("checkpoint_reveals", {
   comparisonId: uuid("comparison_id").notNull().references(() => judgmentComparisons.id),
   revealedAt: timestamp("revealed_at", { withTimezone: true }).notNull().defaultNow()
 });
+
+export const approvalCarryovers = pgTable("approval_carryovers", {
+  id: uuid("id").primaryKey(),
+  approvalId: uuid("approval_id").notNull().references(() => approvals.id),
+  fromPlanId: uuid("from_plan_id").notNull().references(() => executionPlans.id),
+  toPlanId: uuid("to_plan_id").notNull().references(() => executionPlans.id),
+  checkpointId: uuid("checkpoint_id").notNull().references(() => governanceCheckpoints.id),
+  rationale: text("rationale").notNull(),
+  createdAt
+});

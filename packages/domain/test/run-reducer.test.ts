@@ -26,6 +26,16 @@ describe("reduceRunState", () => {
     expect(reduceRunState("awaiting_plan_approval", { type: "plan_quorum_restored_authorized_action" }, "governed_orchestration")).toBe("executing_action");
   });
 
+  it("sends a completed action back to proposing under governed orchestration and to the instruction loop under interactive copilot", () => {
+    expect(reduceRunState("executing_action", { type: "action_completed" }, "governed_orchestration")).toBe("proposing_action");
+    expect(reduceRunState("executing_action", { type: "action_completed" }, "interactive_copilot")).toBe("awaiting_instruction");
+  });
+
+  it("routes a draft pull request to review readiness under both conditions", () => {
+    expect(reduceRunState("executing_action", { type: "draft_pr_opened" }, "governed_orchestration")).toBe("awaiting_review_ready");
+    expect(reduceRunState("executing_action", { type: "draft_pr_opened" }, "interactive_copilot")).toBe("awaiting_review_ready");
+  });
+
   it("rejects a gate approval from the wrong state", () => {
     expect(() => reduceRunState("planning", { type: "operator_continue" }, "governed_orchestration")).toThrow("Invalid run transition");
   });

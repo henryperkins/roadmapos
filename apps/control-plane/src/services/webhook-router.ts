@@ -5,6 +5,7 @@ import type { Condition } from "@roadmapos/domain";
 import type { GitHubWebhookDependencies, IssueCommentPayload, IssueLabeledPayload } from "../jobs/github-webhook-handler.js";
 import type { RunBootstrapService } from "./run-bootstrap-service.js";
 import type { ApprovalService } from "./approval-service.js";
+import type { ActionCoordinator } from "./action-coordinator.js";
 
 export interface ResolvedRunContext {
   runId: string;
@@ -20,7 +21,8 @@ export class WebhookRouter implements GitHubWebhookDependencies {
   constructor(
     private readonly database: Database,
     private readonly bootstrap: RunBootstrapService,
-    private readonly approvals: ApprovalService
+    private readonly approvals: ApprovalService,
+    private readonly coordinator: ActionCoordinator
   ) {}
 
   async startReadyIssue(payload: IssueLabeledPayload): Promise<void> {
@@ -78,6 +80,12 @@ export class WebhookRouter implements GitHubWebhookDependencies {
     switch (command.kind) {
       case "approve_plan":
         await this.approvals.approvePlan({ runId, version: command.version, hashPrefix: command.hashPrefix, ...actor });
+        return;
+      case "next_action":
+        await this.coordinator.requestInteractiveProposal({ runId, githubUserId: actor.githubUserId, githubLogin: actor.githubLogin });
+        return;
+      case "authorize_action":
+        await this.coordinator.authorizeInteractiveAction({ runId, proposalId: command.proposalId, ...actor });
         return;
       default:
         throw new Error(`Command ${command.kind} is not routable yet`);
