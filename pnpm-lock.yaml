@@ -134,6 +134,15 @@ importers:
         specifier: ^3.25.76
         version: 3.25.76
 
+  packages/runner:
+    dependencies:
+      '@roadmapos/domain':
+        specifier: workspace:*
+        version: link:../domain
+      minimatch:
+        specifier: ^10.2.5
+        version: 10.2.5
+
   packages/testkit:
     dependencies:
       '@roadmapos/db':
