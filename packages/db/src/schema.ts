@@ -261,3 +261,10 @@ export const githubDeliveries = pgTable("github_deliveries", {
   processedAt: timestamp("processed_at", { withTimezone: true }),
   processingError: text("processing_error")
 });
+
+export const checkpointReveals = pgTable("checkpoint_reveals", {
+  id: uuid("id").primaryKey(),
+  checkpointId: uuid("checkpoint_id").notNull().references(() => governanceCheckpoints.id),
+  comparisonId: uuid("comparison_id").notNull().references(() => judgmentComparisons.id),
+  revealedAt: timestamp("revealed_at", { withTimezone: true }).notNull().defaultNow()
+});
