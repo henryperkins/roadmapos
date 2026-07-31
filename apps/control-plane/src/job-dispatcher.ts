@@ -18,7 +18,8 @@ const CreateEscalationPayloadSchema = z.object({ checkpointId: z.string().uuid()
 const FinalizePullRequestPayloadSchema = z.object({
   runId: z.string().uuid(),
   proposalId: z.string().uuid(),
-  title: z.string().min(1).optional()
+  title: z.string().min(1).optional(),
+  attemptId: z.string().uuid().optional()
 });
 const ApplyRevisionPayloadSchema = z.object({ checkpointId: z.string().uuid(), operatorId: z.string().min(1) });
 
@@ -68,7 +69,7 @@ export async function dispatchJob(jobType: string, payload: unknown, dependencie
     case "run.finalize_pr": {
       const job = FinalizePullRequestPayloadSchema.parse(payload);
       // The model-supplied pull-request body is ignored; the body is derived from durable evidence.
-      await dependencies.pullRequestService.openDraft(job.runId, job.title ?? "RoadmapOS draft change", job.proposalId);
+      await dependencies.pullRequestService.openDraft(job.runId, job.title ?? "RoadmapOS draft change", job.proposalId, job.attemptId);
       return;
     }
     case "run.apply_revision_decision": {

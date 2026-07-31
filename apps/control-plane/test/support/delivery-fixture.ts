@@ -328,6 +328,14 @@ export async function seedPullRequestFixture(
     });
   }
 
+  // Production reaches finalization from inside a leased attempt; the fixture seeds the same
+  // anchor so the outbox row has something to hang off.
+  await database.sql`
+    INSERT INTO execution_attempts (id, run_id, proposal_id, attempt, action_hash, idempotency_key, state, lease_owner, lease_expires_at)
+    VALUES (${crypto.randomUUID()}::uuid, ${fixture.runId}::uuid, ${proposalId}::uuid, 1, ${sha256Canonical(DRAFT_PR_ACTION)},
+            ${`run:${fixture.runId}:proposal:${proposalId}:attempt:1`}, 'running', 'fixture', now() + interval '15 minutes')
+  `;
+
   return { runId: fixture.runId, baseSha: fixture.baseSha, proposalId, github };
 }
 

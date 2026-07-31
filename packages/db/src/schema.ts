@@ -296,3 +296,34 @@ export const approvalCarryovers = pgTable("approval_carryovers", {
   rationale: text("rationale").notNull(),
   createdAt
 });
+
+export const executionAttempts = pgTable("execution_attempts", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  proposalId: uuid("proposal_id").notNull().references(() => actionProposals.id),
+  attempt: integer("attempt").notNull(),
+  actionHash: char("action_hash", { length: 64 }).notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  state: text("state").notNull(),
+  leaseOwner: text("lease_owner").notNull(),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  resultHash: char("result_hash", { length: 64 }),
+  lastError: text("last_error")
+});
+
+export const executionOutbox = pgTable("execution_outbox", {
+  id: uuid("id").primaryKey(),
+  attemptId: uuid("attempt_id").notNull().references(() => executionAttempts.id),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  effectKind: text("effect_kind").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  requestJson: jsonb("request_json").notNull(),
+  state: text("state").notNull(),
+  externalId: text("external_id"),
+  createdAt,
+  dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+  confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+  lastError: text("last_error")
+});

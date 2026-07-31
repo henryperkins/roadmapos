@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import {
   actionProposals,
-  escalations,
+  insertEscalation,
   executionPlans,
   governanceCheckpoints,
   judgmentComparisons,
@@ -31,8 +31,6 @@ export class EscalationService {
     const operator = record.comparison.operatorPayload as JudgmentClassification;
     if (operator.decision !== "pause_and_escalate") throw new Error("Escalation requires an operator pause decision");
     const action = record.proposal.actionJson as ActionProposal;
-    const previous = await this.database.db.select({ version: escalations.version }).from(escalations).where(eq(escalations.runId, record.run.id));
-    const version = previous.length + 1;
     const payload = EscalationRequestSchema.parse({
       approvedPlanVersion: record.plan?.version ?? null,
       discovered: operator.facts,
@@ -56,7 +54,9 @@ export class EscalationService {
     });
     const id = crypto.randomUUID();
     const contentHash = sha256Canonical(payload);
-    await this.database.db.insert(escalations).values({ id, runId: record.run.id, checkpointId, version, escalationJson: payload, contentHash, status: "awaiting_approval" });
+    const version = await insertEscalation(this.database.sql, {
+      id, runId: record.run.id, checkpointId, escalation: payload, contentHash
+    });
     await this.github.publishIssueComment({
       installationId: record.repository.installationId.toString(), owner: record.repository.owner, repo: record.repository.name, issueNumber: record.item.githubIssueNumber,
       body: renderEscalation(version, contentHash, payload)

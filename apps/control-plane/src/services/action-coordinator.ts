@@ -1,11 +1,23 @@
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import {
+  abandonEffect,
   actionProposals,
   appendAuditEvent,
+  claimExecutionAttempt,
+  completeAttempt,
+  confirmEffect,
+  effectIdempotencyKey,
   enqueueJob,
+  failAttempt,
+  insertActionProposal,
+  insertExplicitInstruction,
+  insertTranscriptEntry,
+  listAttemptEffects,
+  markAttemptRunning,
+  markEffectDispatched,
+  recordIntendedEffect,
   executionPlans,
   ExecutionRepository,
-  explicitInstructions,
   repositories,
   repositoryPolicyVersions,
   runTranscriptEntries,
@@ -40,7 +52,8 @@ export class ActionCoordinator {
     private readonly github: GitHubGateway,
     private readonly publicBaseUrl: string,
     private readonly workspaceService?: WorkspaceService,
-    private readonly authorizationGuard?: Pick<ApprovalService, "revalidateBeforeExecution">
+    private readonly authorizationGuard?: Pick<ApprovalService, "revalidateBeforeExecution">,
+    private readonly leaseOwner = `coordinator-${String(process.pid)}`
   ) {
     this.execution = new ExecutionRepository(database);
   }
@@ -50,8 +63,6 @@ export class ActionCoordinator {
     if (record.run.state !== "proposing_action") {
       throw new Error(`Cannot propose an action while run is ${record.run.state}`);
     }
-    const sequenceRows = await this.database.db.select({ sequence: actionProposals.sequence }).from(actionProposals).where(eq(actionProposals.runId, runId)).orderBy(asc(actionProposals.sequence));
-    if (sequenceRows.length >= MAX_ACTIONS_PER_RUN) throw new Error("Run exceeded the 40-action pilot limit");
     const transcriptRows = await this.database.db.select().from(runTranscriptEntries).where(eq(runTranscriptEntries.runId, runId)).orderBy(asc(runTranscriptEntries.sequence));
     const policy = record.policy.policyJson as RepositoryPolicy;
     const authorization = record.run.condition === "governed_orchestration"
@@ -67,9 +78,10 @@ export class ActionCoordinator {
     };
     const proposed = await this.agent.proposeNextAction(context);
     const proposalId = crypto.randomUUID();
-    const sequence = sequenceRows.length + 1;
     const actionHash = sha256Canonical(proposed.value);
-    await this.database.db.insert(actionProposals).values({ id: proposalId, runId, sequence, actionJson: proposed.value, actionHash, status: "proposed" });
+    const sequence = await insertActionProposal(this.database.sql, {
+      id: proposalId, runId, action: proposed.value, actionHash, maxActions: MAX_ACTIONS_PER_RUN
+    });
     await appendAuditEvent(this.database, { pilotId: record.run.pilotId, eventType: "action.proposed", actorType: "agent", actorId: proposed.providerTraceId ?? "agent", payload: { runId, proposalId, sequence, actionHash, requestHash: proposed.requestHash } });
 
     if (record.run.condition === "interactive_copilot") {
@@ -100,12 +112,18 @@ export class ActionCoordinator {
     if (!proposal || proposal.status !== "proposed") throw new Error("Action proposal is not available for authorization");
     const permission = await this.github.getRepositoryPermission({ installationId: record.repository.installationId.toString(), owner: record.repository.owner, repo: record.repository.name, login: input.githubLogin });
     if (!(["write", "maintain", "admin"] as string[]).includes(permission)) throw new Error("Interactive action authorization requires write permission");
-    const previous = await this.database.db.select({ version: explicitInstructions.version }).from(explicitInstructions).where(eq(explicitInstructions.runId, input.runId));
-    const version = previous.length + 1;
     const instruction = { proposalId: input.proposalId, actionHash: proposal.actionHash, text: `Authorize exactly action proposal ${input.proposalId}` };
     const instructionId = crypto.randomUUID();
     const contentHash = sha256Canonical(instruction);
-    await this.database.db.insert(explicitInstructions).values({ id: instructionId, runId: input.runId, version, instructionText: instruction.text, contentHash, githubUserId: BigInt(input.githubUserId), githubCommentId: BigInt(input.githubCommentId), repositoryPermission: permission });
+    const version = await insertExplicitInstruction(this.database.sql, {
+      id: instructionId,
+      runId: input.runId,
+      instructionText: instruction.text,
+      contentHash,
+      githubUserId: BigInt(input.githubUserId),
+      githubCommentId: BigInt(input.githubCommentId),
+      repositoryPermission: permission
+    });
     return this.routeAuthorizedProposal(record, proposal.id, proposal.actionJson as ActionProposal, { kind: "explicit_instruction", version, contentHash });
   }
 
@@ -175,42 +193,164 @@ export class ActionCoordinator {
       if (!authorization.authorized) throw new Error(`Action is not authorized: ${authorization.source}`);
     }
 
-    const [claimed] = await this.database.sql<{ id: string }[]>`
-      UPDATE action_proposals
-      SET status = 'executing'
-      WHERE id = ${proposalId}::uuid AND run_id = ${runId}::uuid AND status = 'authorized'
-      RETURNING id
-    `;
-    if (!claimed) return;
-
-    if (action.kind === "open_draft_pr") {
-      await enqueueJob(this.database, "run.finalize_pr", { runId, proposalId, title: action.title });
+    const claim = await claimExecutionAttempt(this.database, {
+      runId,
+      proposalId,
+      actionHash: proposal.actionHash,
+      leaseOwner: this.leaseOwner
+    });
+    if (!claim.claimed) {
+      // Another worker holds a live lease, or this action already succeeded. Either way this
+      // invocation must not produce a second external effect.
       return;
     }
-    if (action.kind === "finish") {
-      await this.database.db.update(actionProposals).set({ status: "rejected" }).where(eq(actionProposals.id, proposalId));
-      throw new Error("A finish action is invalid until a durable draft pull request exists");
+    const attempt = claim.claimed;
+    if (attempt.state === "reconciling") {
+      const outcome = await this.reconcileAttempt(record, attempt, action);
+      if (outcome === "already_done") {
+        await completeAttempt(this.database, attempt.id, { reconciled: true });
+        await this.projectSuccess(record, proposalId, "Recovered by reconciliation");
+        return;
+      }
+      if (outcome === "needs_operator") {
+        await failAttempt(this.database, attempt.id, "Execution could not be reconciled after a worker restart");
+        await this.database.db.update(actionProposals).set({ status: "failed" }).where(eq(actionProposals.id, proposalId));
+        await this.execution.transition({ runId, event: { type: "execution_recovery_required" }, actorType: "system", actorId: "action-coordinator" });
+        throw new Error("Execution could not be reconciled; operator recovery is required");
+      }
+      await markAttemptRunning(this.database, attempt.id);
     }
 
-    if (!this.workspaceService) throw new Error("Workspace service is required for execution");
-    const { handle, token } = await this.workspaceService.get(runId);
-    let resultText: string;
-    if (action.kind === "read_files") resultText = JSON.stringify(await this.runner.readFiles(handle, action.paths));
-    else if (action.kind === "apply_patch") resultText = JSON.stringify(await this.runner.applyPatch(handle, action.patch));
-    else if (action.kind === "run_validation") resultText = JSON.stringify(await this.runner.runValidation(handle, action.commandId));
-    else resultText = JSON.stringify(await this.runner.commitAndPush(handle, action.message, token));
+    await this.database.sql`
+      UPDATE action_proposals SET status = 'executing'
+      WHERE id = ${proposalId}::uuid AND run_id = ${runId}::uuid AND status = 'authorized'
+    `;
 
-    // Ordered descending: the transcript sequence continues from the highest recorded entry.
-    const [last] = await this.database.db.select({ sequence: runTranscriptEntries.sequence }).from(runTranscriptEntries).where(eq(runTranscriptEntries.runId, runId)).orderBy(desc(runTranscriptEntries.sequence)).limit(1);
-    await this.database.db.insert(runTranscriptEntries).values({ id: crypto.randomUUID(), runId, sequence: (last?.sequence ?? 0) + 1, role: "tool", content: resultText, contentHash: sha256Text(resultText) });
+    try {
+      if (action.kind === "open_draft_pr") {
+        // Enqueued inside the attempt: if this crashes the lease expires, reconciliation checks
+        // GitHub for an existing pull request, and only then is the job re-enqueued.
+        await enqueueJob(this.database, "run.finalize_pr", { runId, proposalId, title: action.title, attemptId: attempt.id });
+        await completeAttempt(this.database, attempt.id, { enqueued: "run.finalize_pr" });
+        return;
+      }
+      if (action.kind === "finish") {
+        await failAttempt(this.database, attempt.id, "finish is invalid before a durable draft pull request exists");
+        await this.database.db.update(actionProposals).set({ status: "rejected" }).where(eq(actionProposals.id, proposalId));
+        await this.execution.transition({ runId, event: { type: "action_failed" }, actorType: "system", actorId: "action-coordinator" });
+        throw new Error("A finish action is invalid until a durable draft pull request exists");
+      }
+
+      if (!this.workspaceService) throw new Error("Workspace service is required for execution");
+      const { handle, token } = await this.workspaceService.get(runId);
+      let resultText: string;
+      if (action.kind === "read_files") resultText = JSON.stringify(await this.runner.readFiles(handle, action.paths));
+      else if (action.kind === "apply_patch") resultText = JSON.stringify(await this.runner.applyPatch(handle, action.patch));
+      else if (action.kind === "run_validation") resultText = JSON.stringify(await this.runner.runValidation(handle, action.commandId));
+      else {
+        // The only action here that mutates the remote, so it is recorded as an intended effect
+        // before it is attempted and confirmed after.
+        const effect = await recordIntendedEffect(this.database, {
+          attemptId: attempt.id,
+          runId,
+          effectKind: "git_commit_push",
+          idempotencyKey: effectIdempotencyKey({ attemptKey: attempt.idempotencyKey, effectKind: "git_commit_push" }),
+          request: { branchName: record.run.branchName, message: action.message }
+        });
+        await markEffectDispatched(this.database, effect.id);
+        const pushed = await this.runner.commitAndPush(handle, action.message, token);
+        await confirmEffect(this.database, effect.id, pushed.commitSha);
+        resultText = JSON.stringify(pushed);
+      }
+
+      await insertTranscriptEntry(this.database.sql, { runId, role: "tool", content: resultText, contentHash: sha256Text(resultText) });
+      await completeAttempt(this.database, attempt.id, { resultText });
+      await this.projectSuccess(record, proposalId, resultText);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (action.kind === "finish") throw error;
+      await failAttempt(this.database, attempt.id, message);
+      await this.database.db.update(actionProposals).set({ status: "failed" }).where(eq(actionProposals.id, proposalId));
+      const [current] = await this.database.db.select({ state: runs.state }).from(runs).where(eq(runs.id, runId));
+      if (current?.state === "executing_action") {
+        await this.execution.transition({ runId, event: { type: "action_failed" }, actorType: "system", actorId: "action-coordinator" });
+      }
+      throw error;
+    }
+  }
+
+  private async projectSuccess(
+    record: Awaited<ReturnType<ActionCoordinator["loadRun"]>>,
+    proposalId: string,
+    _resultText: string
+  ): Promise<void> {
     await this.database.db.update(actionProposals).set({ status: "executed", executedAt: new Date() }).where(eq(actionProposals.id, proposalId));
-    await this.execution.transition({
-      runId,
-      event: { type: "action_completed" },
-      actorType: "system",
-      actorId: "action-coordinator"
-    });
-    if (record.run.condition === "governed_orchestration") await enqueueJob(this.database, "run.propose_action", { runId });
+    const [current] = await this.database.db.select({ state: runs.state }).from(runs).where(eq(runs.id, record.run.id));
+    if (current?.state === "executing_action") {
+      await this.execution.transition({
+        runId: record.run.id,
+        event: { type: "action_completed" },
+        actorType: "system",
+        actorId: "action-coordinator"
+      });
+    }
+    if (record.run.condition === "governed_orchestration") await enqueueJob(this.database, "run.propose_action", { runId: record.run.id });
+  }
+
+  /**
+   * Decides what a crashed attempt actually accomplished by checking external state, never by
+   * assuming. `already_done` means the effect is durably present; `safe_to_retry` means no external
+   * effect escaped; `needs_operator` means the two cannot be told apart and a human must look.
+   */
+  private async reconcileAttempt(
+    record: Awaited<ReturnType<ActionCoordinator["loadRun"]>>,
+    attempt: { id: string; idempotencyKey: string },
+    action: ActionProposal
+  ): Promise<"already_done" | "safe_to_retry" | "needs_operator"> {
+    const effects = await listAttemptEffects(this.database, attempt.id);
+    if (effects.length === 0) return "safe_to_retry";
+
+    for (const effect of effects) {
+      if (effect.state === "confirmed") continue;
+      if (effect.state === "pending") continue;
+      // Dispatched but unconfirmed: the crash happened across the external call.
+      if (effect.effectKind === "git_commit_push") {
+        const head = await this.github.getBranchHead({
+          installationId: record.repository.installationId.toString(),
+          owner: record.repository.owner,
+          repo: record.repository.name,
+          branch: record.run.branchName
+        }).catch(() => null);
+        if (head === null) return "needs_operator";
+        const request = effect.request as { message?: string };
+        const remoteHasWork = head !== record.run.baseSha;
+        if (!remoteHasWork) {
+          await abandonEffect(this.database, effect.id, "The remote branch does not contain the commit; no effect escaped");
+          return "safe_to_retry";
+        }
+        await confirmEffect(this.database, effect.id, head);
+        await insertTranscriptEntry(this.database.sql, {
+          runId: record.run.id,
+          role: "system",
+          content: JSON.stringify({ reconciled: "git_commit_push", head, message: request.message ?? null }),
+          contentHash: sha256Text(`reconciled:${head}`)
+        });
+        return "already_done";
+      }
+      if (effect.effectKind === "github_draft_pull_request") {
+        const [existing] = await this.database.sql<{ number: number }[]>`
+          SELECT number FROM draft_pull_requests WHERE run_id = ${record.run.id}::uuid
+        `;
+        if (existing) {
+          await confirmEffect(this.database, effect.id, String(existing.number));
+          return "already_done";
+        }
+        return "needs_operator";
+      }
+      return "needs_operator";
+    }
+    if (action.kind === "read_files" || action.kind === "run_validation") return "safe_to_retry";
+    return "safe_to_retry";
   }
 
   private async loadRun(runId: string) {

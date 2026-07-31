@@ -18,6 +18,8 @@ export const RunEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("editorial_revision_accepted") }),
   z.object({ type: z.literal("material_revision_requires_approval") }),
   z.object({ type: z.literal("action_completed") }),
+  z.object({ type: z.literal("action_failed") }),
+  z.object({ type: z.literal("execution_recovery_required") }),
   z.object({ type: z.literal("escalation_quorum_reached") }),
   z.object({ type: z.literal("escalation_quorum_lost") }),
   z.object({ type: z.literal("escalation_rejected") }),

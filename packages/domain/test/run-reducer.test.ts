@@ -40,3 +40,19 @@ describe("reduceRunState", () => {
     expect(() => reduceRunState("planning", { type: "operator_continue" }, "governed_orchestration")).toThrow("Invalid run transition");
   });
 });
+
+describe("execution failure and recovery", () => {
+  it("returns a failed action to each condition's next state", () => {
+    expect(reduceRunState("executing_action", { type: "action_failed" }, "governed_orchestration")).toBe("proposing_action");
+    expect(reduceRunState("executing_action", { type: "action_failed" }, "interactive_copilot")).toBe("awaiting_instruction");
+  });
+
+  it("routes an unreconcilable execution to the operator gate rather than retrying it", () => {
+    expect(reduceRunState("executing_action", { type: "execution_recovery_required" }, "governed_orchestration")).toBe("awaiting_operator_gate");
+    expect(reduceRunState("executing_action", { type: "execution_recovery_required" }, "interactive_copilot")).toBe("awaiting_operator_gate");
+  });
+
+  it("keeps a run already parked at the gate parked", () => {
+    expect(reduceRunState("awaiting_operator_gate", { type: "execution_recovery_required" }, "governed_orchestration")).toBe("awaiting_operator_gate");
+  });
+});

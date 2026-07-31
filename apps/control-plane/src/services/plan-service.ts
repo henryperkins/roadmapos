@@ -7,6 +7,8 @@ import {
   executionPlans,
   ExecutionRepository,
   governanceCheckpoints,
+  insertExecutionPlanVersion,
+  insertInitialPlanAsCurrent,
   judgmentComparisons,
   repositories,
   repositoryPolicyVersions,
@@ -68,11 +70,9 @@ export class PlanService {
     };
     const generated = await this.agent.generatePlan(input);
     const id = crypto.randomUUID();
-    const version = 1;
     const contentHash = sha256Canonical(generated.value);
-    await this.database.db.transaction(async (transaction) => {
-      await transaction.insert(executionPlans).values({ id, runId, version, planJson: generated.value, contentHash, baseSha: record.run.baseSha, changeClassification: "initial" });
-      await transaction.update(runs).set({ currentPlanId: id, updatedAt: new Date() }).where(eq(runs.id, runId));
+    const version = await insertInitialPlanAsCurrent(this.database.sql, {
+      id, runId, plan: generated.value, contentHash, baseSha: record.run.baseSha
     });
     await this.execution.transition({
       runId,
@@ -123,14 +123,12 @@ export class PlanService {
       repositoryContext: []
     });
     const planId = crypto.randomUUID();
-    const version = record.current.version + 1;
     const contentHash = sha256Canonical(generated.value);
     const facts = diffExecutionPlans(record.current.planJson as ExecutionPlanDraft, generated.value);
-    await this.database.db.insert(executionPlans).values({
+    const version = await insertExecutionPlanVersion(this.database.sql, {
       id: planId,
       runId,
-      version,
-      planJson: generated.value,
+      plan: generated.value,
       contentHash,
       baseSha: record.run.baseSha,
       supersedesPlanId: record.current.id,

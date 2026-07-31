@@ -22,6 +22,7 @@ const transitions: Record<RunState, Partial<Record<RunEvent["type"], RunState>>>
   },
   awaiting_operator_gate: {
     operator_continue: "executing_action",
+    execution_recovery_required: "awaiting_operator_gate",
     operator_pause: "awaiting_escalation_approval",
     operator_stop: "terminated",
     editorial_revision_accepted: "proposing_action",
@@ -37,6 +38,8 @@ const transitions: Record<RunState, Partial<Record<RunEvent["type"], RunState>>>
   },
   executing_action: {
     action_completed: "proposing_action",
+    action_failed: "proposing_action",
+    execution_recovery_required: "awaiting_operator_gate",
     draft_pr_opened: "awaiting_review_ready",
     plan_quorum_lost: "awaiting_plan_approval",
     escalation_quorum_lost: "awaiting_escalation_approval",
@@ -55,7 +58,7 @@ export function reduceRunState(current: RunState, event: RunEvent, condition: Co
   if (current === "planning" && event.type === "instruction_received" && condition !== "interactive_copilot") {
     throw new Error("Invalid run transition: only interactive copilot accepts an instruction from planning");
   }
-  if (current === "executing_action" && event.type === "action_completed") {
+  if (current === "executing_action" && (event.type === "action_completed" || event.type === "action_failed")) {
     return condition === "interactive_copilot" ? "awaiting_instruction" : "proposing_action";
   }
   if (current === "awaiting_escalation_approval" && event.type === "escalation_rejected" && condition === "interactive_copilot") {

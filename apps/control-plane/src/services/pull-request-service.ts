@@ -1,11 +1,15 @@
 import { asc, eq } from "drizzle-orm";
 import {
   actionProposals,
+  confirmEffect,
   deviations,
   draftPullRequests,
   escalations,
   executionPlans,
   ExecutionRepository,
+  findEffect,
+  markEffectDispatched,
+  recordIntendedEffect,
   repositories,
   runs,
   runTranscriptEntries,
@@ -40,7 +44,7 @@ export class PullRequestService {
     private readonly execution = new ExecutionRepository(database)
   ) {}
 
-  async openDraft(runId: string, title: string, proposalId: string) {
+  async openDraft(runId: string, title: string, proposalId: string, attemptId?: string) {
     const [record] = await this.database.db.select({ run: runs, repository: repositories, item: workItems, plan: executionPlans })
       .from(runs)
       .innerJoin(repositories, eq(repositories.id, runs.repositoryId))
@@ -76,6 +80,24 @@ export class PullRequestService {
       escalations: escalationRows,
       transcript
     });
+    // A draft pull request is the terminal repository write, so the intent is recorded durably
+    // before GitHub is called. A crash between the call and the projection is then recoverable:
+    // the outbox row says an attempt was dispatched, and reconciliation can look for the PR.
+    const effectKey = `run:${runId}:github_draft_pull_request`;
+    const prior = await findEffect(this.database, effectKey);
+    if (prior?.state === "confirmed" && prior.externalId) {
+      await this.completeProjection(record.run, proposalId);
+      const [row] = await this.database.db.select().from(draftPullRequests).where(eq(draftPullRequests.runId, runId));
+      if (row) return { number: row.number, url: row.htmlUrl };
+    }
+    const effect = prior ?? await recordIntendedEffect(this.database, {
+      attemptId: attemptId ?? await this.attemptIdFor(proposalId),
+      runId,
+      effectKind: "github_draft_pull_request",
+      idempotencyKey: effectKey,
+      request: { base: record.repository.defaultBranch, head: record.run.branchName, title }
+    });
+    await markEffectDispatched(this.database, effect.id);
     const created = await this.github.openDraftPullRequest({
       installationId: record.repository.installationId.toString(),
       owner: record.repository.owner,
@@ -85,6 +107,7 @@ export class PullRequestService {
       title,
       body
     });
+    await confirmEffect(this.database, effect.id, created.id);
     await this.database.db.insert(draftPullRequests).values({
       id: crypto.randomUUID(),
       runId,
@@ -96,6 +119,15 @@ export class PullRequestService {
     }).onConflictDoNothing();
     await this.completeProjection(record.run, proposalId);
     return { number: created.number, url: created.url };
+  }
+
+  /** Finds the attempt that authorized this finalization, so the outbox row is anchored to it. */
+  private async attemptIdFor(proposalId: string): Promise<string> {
+    const [row] = await this.database.sql<{ id: string }[]>`
+      SELECT id FROM execution_attempts WHERE proposal_id = ${proposalId}::uuid ORDER BY attempt DESC LIMIT 1
+    `;
+    if (!row) throw new Error("Draft PR finalization has no execution attempt to anchor to");
+    return row.id;
   }
 
   private async completeProjection(run: RunRow, proposalId: string): Promise<void> {
