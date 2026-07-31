@@ -1,6 +1,6 @@
-import { randomInt } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { appendAuditEvent, matchedPairs, pilotStudies, repositories, repositoryPolicyVersions, workItems, type Database } from "@roadmapos/db";
+import { appendAuditEvent, internalAccessTokens, matchedPairs, participants, pilotStudies, repositories, repositoryPolicyVersions, workItems, type Database } from "@roadmapos/db";
 import { sha256Canonical } from "@roadmapos/domain";
 import { parseRepositoryPolicy } from "@roadmapos/policy";
 
@@ -13,6 +13,54 @@ export class PilotRegistry {
     await this.database.db.insert(pilotStudies).values({ id, name, status: "draft" });
     await appendAuditEvent(this.database, { pilotId: id, eventType: "pilot.created", actorType: "operator", actorId: "operator", payload: { name } });
     return id;
+  }
+
+  async registerParticipant(input: {
+    id?: string;
+    pilotId: string;
+    githubUserId: string;
+    githubLogin: string;
+    studyRole: "maintainer" | "operator" | "auditor";
+  }): Promise<string> {
+    const id = input.id ?? crypto.randomUUID();
+    await this.database.db.insert(participants).values({
+      id,
+      pilotId: input.pilotId,
+      githubUserId: BigInt(input.githubUserId),
+      githubLogin: input.githubLogin,
+      studyRole: input.studyRole
+    });
+    await appendAuditEvent(this.database, {
+      pilotId: input.pilotId,
+      eventType: "participant.registered",
+      actorType: "operator",
+      actorId: "operator",
+      payload: { participantId: id, githubLogin: input.githubLogin, studyRole: input.studyRole }
+    });
+    return id;
+  }
+
+  /**
+   * Mints an internal bearer token bound to one participant. Only the SHA-256 is stored, and the
+   * plaintext is returned once — there is no way to recover it or to reassign the token later.
+   */
+  async issueInternalToken(input: { participantId: string; pilotId: string; label: string }): Promise<{ id: string; token: string }> {
+    const token = randomBytes(32).toString("base64url");
+    const id = crypto.randomUUID();
+    await this.database.db.insert(internalAccessTokens).values({
+      id,
+      participantId: input.participantId,
+      tokenSha256: createHash("sha256").update(token, "utf8").digest("hex"),
+      label: input.label
+    });
+    await appendAuditEvent(this.database, {
+      pilotId: input.pilotId,
+      eventType: "participant.token_issued",
+      actorType: "operator",
+      actorId: "operator",
+      payload: { participantId: input.participantId, tokenId: id, label: input.label }
+    });
+    return { id, token };
   }
 
   async registerRepository(input: {

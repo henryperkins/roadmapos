@@ -12,7 +12,7 @@ import {
   workItems,
   type Database
 } from "@roadmapos/db";
-import { sha256Text, type Condition, type DeviationDisclosure, type EscalationRequest, type ExecutionPlanDraft } from "@roadmapos/domain";
+import { sha256Text, type DeviationDisclosure, type EscalationRequest, type ExecutionPlanDraft } from "@roadmapos/domain";
 import type { GitHubGateway } from "@roadmapos/github";
 
 type RunRow = typeof runs.$inferSelect;
@@ -106,8 +106,6 @@ export class PullRequestService {
     if (current.state !== "executing_action") throw new Error(`Cannot finalize draft PR while run is ${current.state}`);
     await this.execution.transition({
       runId: run.id,
-      pilotId: run.pilotId,
-      condition: run.condition as Condition,
       event: { type: "draft_pr_opened" },
       actorType: "system",
       actorId: "pull-request-service"

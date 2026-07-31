@@ -27,9 +27,9 @@ export async function buildApp(rawConfig: ControlPlaneConfig & BuildAppOverrides
   app.addHook("onClose", async () => database.close());
   const checkpointService = rawConfig.checkpointService
     ?? new CheckpointService(database, new OpenAIAgentGateway(process.env.OPENAI_MODEL ?? "gpt-5"), config.artifactEncryptionKeyBase64);
-  await registerInternalAuth(app, config);
+  await registerInternalAuth(app, database, config.adminTokenSha256);
   await registerPilotRoutes(app, new PilotRegistry(database));
-  await registerOperatorCheckpointRoutes(app, checkpointService);
+  await registerOperatorCheckpointRoutes(app, database, checkpointService);
   await registerGitHubWebhookRoute(app, database, config);
   app.get("/health", async () => ({ ok: true }));
   return app;

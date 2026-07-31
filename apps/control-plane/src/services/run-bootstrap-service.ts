@@ -36,8 +36,6 @@ export class RunBootstrapService {
     });
     await this.execution.transition({
       runId,
-      pilotId: input.pilotId,
-      condition: input.condition,
       event: { type: "analysis_started" },
       actorType: "github",
       actorId: "ready-label"

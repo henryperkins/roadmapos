@@ -112,7 +112,7 @@ export class WebhookRouter implements GitHubWebhookDependencies {
     const [run] = await this.database.db.select().from(runs).where(eq(runs.id, runId));
     if (!run) throw new Error("Run not found");
     await this.execution.transition({
-      runId, pilotId: run.pilotId, condition: run.condition as Condition,
+      runId,
       event: { type: "review_ready_declared" }, actorType: "maintainer", actorId
     });
   }
@@ -122,7 +122,7 @@ export class WebhookRouter implements GitHubWebhookDependencies {
     if (!run) throw new Error("Run not found");
     await this.database.sql.begin(async (transaction) => {
       await this.execution.transitionTx(transaction, {
-        runId, pilotId: run.pilotId, condition: run.condition as Condition,
+        runId,
         event: { type: "terminated" }, actorType: "maintainer", actorId
       });
       await transaction`UPDATE runs SET termination_reason = ${reason} WHERE id = ${runId}::uuid`;

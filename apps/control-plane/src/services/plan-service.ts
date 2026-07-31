@@ -76,8 +76,6 @@ export class PlanService {
     });
     await this.execution.transition({
       runId,
-      pilotId: record.run.pilotId,
-      condition: "governed_orchestration",
       event: { type: "plan_published" },
       actorType: "agent",
       actorId: generated.providerTraceId ?? "agent"
@@ -181,7 +179,7 @@ export class PlanService {
 
     if (operator.decision === "stop") {
       await this.execution.transition({
-        runId: record.run.id, pilotId: record.run.pilotId, condition: "governed_orchestration",
+        runId: record.run.id,
         event: { type: "operator_stop" }, actorType: "operator", actorId: operatorId
       });
       return "stopped";
@@ -203,7 +201,7 @@ export class PlanService {
         await transaction.update(runs).set({ currentPlanId: candidate.id, updatedAt: new Date() }).where(eq(runs.id, record.run.id));
       });
       await this.execution.transition({
-        runId: record.run.id, pilotId: record.run.pilotId, condition: "governed_orchestration",
+        runId: record.run.id,
         event: { type: "editorial_revision_accepted" }, actorType: "operator", actorId: operatorId
       });
       return "editorial_carried";
@@ -222,7 +220,7 @@ export class PlanService {
       await transaction.update(runs).set({ currentPlanId: candidate.id, updatedAt: new Date() }).where(eq(runs.id, record.run.id));
     });
     await this.execution.transition({
-      runId: record.run.id, pilotId: record.run.pilotId, condition: "governed_orchestration",
+      runId: record.run.id,
       event: { type: "material_revision_requires_approval" }, actorType: "operator", actorId: operatorId
     });
     return "approval_required";

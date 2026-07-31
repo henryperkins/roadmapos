@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { beforeEach, expect, it } from "vitest";
 import { createDatabase, jobs } from "@roadmapos/db";
 import { eq } from "drizzle-orm";
@@ -15,8 +15,7 @@ const secret = "webhook-secret-123";
 function config(databaseUrl: string) {
   return {
     databaseUrl,
-    operatorTokenSha256: "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
-    auditorTokenSha256: "b49f425a7e1f9cff3856329ada223f2f9d368f15a00cf48df16ca95986137fe8",
+    adminTokenSha256: createHash("sha256").update("admin-bootstrap", "utf8").digest("hex"),
     artifactEncryptionKeyBase64: Buffer.alloc(32, 1).toString("base64"),
     pilotLinkSecret: "pilot-link-secret-123",
     publicBaseUrl: "http://localhost:3000",
@@ -88,7 +87,7 @@ it("still parses JSON on the internal API after installing the raw webhook parse
   const created = await app.inject({
     method: "POST",
     url: "/internal/pilots",
-    headers: { authorization: "Bearer hi" },
+    headers: { authorization: "Bearer admin-bootstrap" },
     payload: { name: "Pilot A" }
   });
   expect(created.statusCode).toBe(201);

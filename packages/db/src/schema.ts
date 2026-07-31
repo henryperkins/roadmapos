@@ -34,6 +34,24 @@ export const repositoryPolicyVersions = pgTable("repository_policy_versions", {
   createdAt
 });
 
+export const participants = pgTable("participants", {
+  id: uuid("id").primaryKey(),
+  pilotId: uuid("pilot_id").notNull().references(() => pilotStudies.id),
+  githubUserId: bigint("github_user_id", { mode: "bigint" }).notNull(),
+  githubLogin: text("github_login").notNull(),
+  studyRole: text("study_role").notNull(),
+  createdAt
+});
+
+export const internalAccessTokens = pgTable("internal_access_tokens", {
+  id: uuid("id").primaryKey(),
+  participantId: uuid("participant_id").notNull().references(() => participants.id),
+  tokenSha256: char("token_sha256", { length: 64 }).notNull(),
+  label: text("label").notNull(),
+  createdAt,
+  revokedAt: timestamp("revoked_at", { withTimezone: true })
+});
+
 export const workItems = pgTable("work_items", {
   id: uuid("id").primaryKey(),
   repositoryId: uuid("repository_id").notNull().references(() => repositories.id),

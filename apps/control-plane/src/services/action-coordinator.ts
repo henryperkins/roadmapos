@@ -86,8 +86,6 @@ export class ActionCoordinator {
     }
     await this.execution.transition({
       runId: input.runId,
-      pilotId: record.run.pilotId,
-      condition: "interactive_copilot",
       event: { type: "instruction_received" },
       actorType: "maintainer",
       actorId: input.githubUserId
@@ -121,8 +119,6 @@ export class ActionCoordinator {
       await this.database.db.update(actionProposals).set({ status: "authorized" }).where(and(eq(actionProposals.id, proposalId), eq(actionProposals.status, "proposed")));
       await this.execution.transition({
         runId: record.run.id,
-        pilotId: record.run.pilotId,
-        condition: record.run.condition as Condition,
         event: { type: "nonconsequential_action_authorized" },
         actorType: "system",
         actorId: "action-coordinator"
@@ -210,8 +206,6 @@ export class ActionCoordinator {
     await this.database.db.update(actionProposals).set({ status: "executed", executedAt: new Date() }).where(eq(actionProposals.id, proposalId));
     await this.execution.transition({
       runId,
-      pilotId: record.run.pilotId,
-      condition: record.run.condition as Condition,
       event: { type: "action_completed" },
       actorType: "system",
       actorId: "action-coordinator"

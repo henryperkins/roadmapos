@@ -28,8 +28,6 @@ describe("execution workflow persistence", () => {
     await expect(database.sql`UPDATE runs SET state = 'completed' WHERE id = ${fixture.runId}::uuid`).rejects.toThrow("ExecutionRepository");
     const next = await new ExecutionRepository(database).transition({
       runId: fixture.runId,
-      pilotId: fixture.pilotId,
-      condition: "governed_orchestration",
       event: { type: "analysis_started" },
       actorType: "system",
       actorId: "test"

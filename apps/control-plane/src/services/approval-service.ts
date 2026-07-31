@@ -15,7 +15,6 @@ import {
   runs,
   type Database
 } from "@roadmapos/db";
-import type { Condition } from "@roadmapos/domain";
 import type { RepositoryPermission } from "@roadmapos/domain";
 import type { GitHubGateway } from "@roadmapos/github";
 import type { RepositoryPolicy } from "@roadmapos/policy";
@@ -154,7 +153,7 @@ export class ApprovalService {
     `;
     if (!pending) {
       await this.execution.transition({
-        runId: input.runId, pilotId: input.pilotId, condition: "governed_orchestration",
+        runId: input.runId,
         event: { type: "plan_quorum_reached" }, actorType: "system", actorId: "approval-service"
       });
       return;
@@ -189,7 +188,7 @@ export class ApprovalService {
           WHERE id = ${pending.proposal_id}::uuid AND status = 'authorized'
         `;
         await this.execution.transitionTx(transaction, {
-          runId: input.runId, pilotId: input.pilotId, condition: "governed_orchestration",
+          runId: input.runId,
           event: { type: "plan_quorum_restored_pending_escalation" }, actorType: "system", actorId: "approval-service"
         });
       });
@@ -202,7 +201,7 @@ export class ApprovalService {
         WHERE id = ${pending.proposal_id}::uuid AND status = 'proposed'
       `;
       await this.execution.transitionTx(transaction, {
-        runId: input.runId, pilotId: input.pilotId, condition: "governed_orchestration",
+        runId: input.runId,
         event: { type: "plan_quorum_restored_authorized_action" }, actorType: "system", actorId: "approval-service"
       });
     });
@@ -325,7 +324,7 @@ export class ApprovalService {
     if (record.run.condition === "governed_orchestration" && planEligibility.distinctEligibleApprovers < policy.authorization.executionPlanQuorum) {
       if (record.run.state !== "awaiting_plan_approval") {
         await this.execution.transition({
-          runId: input.runId, pilotId: record.run.pilotId, condition: "governed_orchestration",
+          runId: input.runId,
           event: { type: "plan_quorum_lost" }, actorType: "system", actorId: "approval-service"
         });
       }
@@ -358,8 +357,6 @@ export class ApprovalService {
         `;
         await this.execution.transitionTx(transaction, {
           runId: input.runId,
-          pilotId: record.run.pilotId,
-          condition: record.run.condition as Condition,
           event: { type: "escalation_quorum_reached" },
           actorType: "system",
           actorId: "approval-service"
@@ -401,8 +398,6 @@ export class ApprovalService {
       await transaction`UPDATE action_proposals SET status = 'rejected' WHERE id = ${record.proposal.id}::uuid AND status = 'proposed'`;
       await this.execution.transitionTx(transaction, {
         runId: input.runId,
-        pilotId: record.run.pilotId,
-        condition: record.run.condition as Condition,
         event: { type: "escalation_rejected" },
         actorType: "maintainer",
         actorId: input.githubUserId
@@ -480,7 +475,7 @@ export class ApprovalService {
           WHERE run_id = ${input.runId}::uuid AND status = 'authorized'
         `;
         if (record.run.state !== "awaiting_plan_approval") {
-          await this.execution.transition({ runId: input.runId, pilotId: record.run.pilotId, condition: "governed_orchestration", event: { type: "plan_quorum_lost" }, actorType: "system", actorId: "approval-service" });
+          await this.execution.transition({ runId: input.runId, event: { type: "plan_quorum_lost" }, actorType: "system", actorId: "approval-service" });
         }
         throw new Error("Execution-plan approval quorum was lost; replacement approval is required");
       }
@@ -507,7 +502,7 @@ export class ApprovalService {
       await transaction`UPDATE escalations SET status = 'awaiting_approval' WHERE id = ${approved.escalation_id}::uuid AND status = 'approved'`;
       await transaction`UPDATE action_proposals SET status = 'proposed' WHERE id = ${approved.proposal_id}::uuid AND status = 'authorized'`;
       await this.execution.transitionTx(transaction, {
-        runId: input.runId, pilotId: record.run.pilotId, condition: record.run.condition as Condition,
+        runId: input.runId,
         event: { type: "escalation_quorum_lost" }, actorType: "system", actorId: "approval-service"
       });
     });

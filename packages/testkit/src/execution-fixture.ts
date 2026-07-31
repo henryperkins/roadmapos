@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import {
   actionProposals,
+  internalAccessTokens,
   matchedPairs,
+  participants,
   pilotStudies,
   repositories,
   repositoryPolicyVersions,
@@ -36,8 +38,7 @@ export interface ExecutionFixtureOptions {
 
 export interface ControlPlaneTestConfig {
   databaseUrl: string;
-  operatorTokenSha256: string;
-  auditorTokenSha256: string;
+  adminTokenSha256: string;
   artifactEncryptionKeyBase64: string;
   pilotLinkSecret: string;
   publicBaseUrl: string;
@@ -49,6 +50,11 @@ export interface ControlPlaneTestConfig {
 
 export interface ExecutionFixture {
   pilotId: string;
+  operatorParticipantId: string;
+  /** Bearer token bound to this fixture's own operator participant. */
+  operatorToken: string;
+  /** Bearer token bound to this fixture's own auditor participant. */
+  auditorToken: string;
   repositoryId: string;
   policyVersionId: string;
   policy: RepositoryPolicy;
@@ -75,13 +81,42 @@ export interface ExecutionFixture {
   ) => ControlPlaneTestConfig & T;
 }
 
-/** The plaintext bearer token whose SHA-256 the fixture control-plane config expects for operators. */
+/** Bootstrap-only bearer token; it can create pilots but never classify a checkpoint. */
+export const FIXTURE_ADMIN_TOKEN = "admin-bootstrap";
+/** Bearer token bound to the fixture's operator participant. */
 export const FIXTURE_OPERATOR_TOKEN = "hi";
-/** The plaintext bearer token whose SHA-256 the fixture control-plane config expects for auditors. */
+/** Bearer token bound to the fixture's auditor participant. */
 export const FIXTURE_AUDITOR_TOKEN = "bye-auditor";
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * Binds a bearer token to a real participant row, so fixture requests authenticate the same way
+ * production does: token → participant → pilot, never a shared role secret.
+ */
+export async function seedInternalParticipant(
+  database: Database,
+  input: { pilotId: string; token: string; studyRole: "operator" | "auditor"; githubLogin?: string; githubUserId?: string }
+): Promise<string> {
+  const participantId = crypto.randomUUID();
+  await database.db.insert(participants).values({
+    id: participantId,
+    pilotId: input.pilotId,
+    githubUserId: BigInt(input.githubUserId ?? (input.studyRole === "operator" ? 9001 : 9002)),
+    githubLogin: input.githubLogin ?? `fixture-${input.studyRole}`,
+    studyRole: input.studyRole
+  });
+  // A token binds to exactly one participant globally. When several fixtures share a database the
+  // well-known token stays with whichever pilot claimed it first; each fixture also gets its own.
+  await database.db.insert(internalAccessTokens).values({
+    id: crypto.randomUUID(),
+    participantId,
+    tokenSha256: sha256Hex(input.token),
+    label: `fixture ${input.studyRole}`
+  }).onConflictDoNothing();
+  return participantId;
 }
 
 export function fixturePolicySource(input: {
@@ -201,6 +236,12 @@ export async function seedExecutionFixture(
   const branchName = `roadmapos/${runId}`;
 
   await database.db.insert(pilotStudies).values({ id: pilotId, name: "Execution fixture", status: "running" });
+  const operatorToken = `${FIXTURE_OPERATOR_TOKEN}-${pilotId}`;
+  const auditorToken = `${FIXTURE_AUDITOR_TOKEN}-${pilotId}`;
+  const operatorParticipantId = await seedInternalParticipant(database, { pilotId, token: operatorToken, studyRole: "operator" });
+  await seedInternalParticipant(database, { pilotId, token: FIXTURE_OPERATOR_TOKEN, studyRole: "operator", githubUserId: "9003", githubLogin: "fixture-operator-wellknown" });
+  await seedInternalParticipant(database, { pilotId, token: auditorToken, studyRole: "auditor" });
+  await seedInternalParticipant(database, { pilotId, token: FIXTURE_AUDITOR_TOKEN, studyRole: "auditor", githubUserId: "9004", githubLogin: "fixture-auditor-wellknown" });
   await database.db.insert(repositories).values({
     id: repositoryId,
     pilotId,
@@ -304,6 +345,9 @@ export async function seedExecutionFixture(
 
   return {
     pilotId,
+    operatorParticipantId,
+    operatorToken,
+    auditorToken,
     repositoryId,
     policyVersionId,
     policy,
@@ -322,8 +366,7 @@ export async function seedExecutionFixture(
     checkpointInput: { runId, source: "agent_detected", actionProposalId: proposalId, package: checkpointPackage },
     controlPlaneConfig: (overrides) => ({
       databaseUrl: "",
-      operatorTokenSha256: sha256Hex(FIXTURE_OPERATOR_TOKEN),
-      auditorTokenSha256: sha256Hex(FIXTURE_AUDITOR_TOKEN),
+      adminTokenSha256: sha256Hex(FIXTURE_ADMIN_TOKEN),
       artifactEncryptionKeyBase64: Buffer.alloc(32, 1).toString("base64"),
       pilotLinkSecret: "pilot-link-secret-123",
       publicBaseUrl: FIXTURE_PUBLIC_BASE_URL,

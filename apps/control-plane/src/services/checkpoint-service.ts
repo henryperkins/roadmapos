@@ -123,8 +123,6 @@ export class CheckpointService {
     if (input.source !== "challenge") {
       await this.execution.transition({
         runId: input.runId,
-        pilotId: run.pilotId,
-        condition: run.condition as Condition,
         event,
         actorType: "agent",
         actorId: agentResult.providerTraceId ?? "agent"
@@ -236,8 +234,6 @@ export class CheckpointService {
         }
         await this.execution.transitionTx(transaction, {
           runId: checkpoint.run_id,
-          pilotId: checkpoint.pilot_id,
-          condition: checkpoint.condition,
           event: { type: operator.decision === "continue" ? "operator_continue" : operator.decision === "pause_and_escalate" ? "operator_pause" : "operator_stop" },
           actorType: "operator",
           actorId: input.operatorId

@@ -4,29 +4,44 @@ import { appendAuditEventTx, type SqlTransaction } from "./audit-events.js";
 
 export interface RunTransitionInput {
   runId: string;
-  pilotId: string;
-  condition: Condition;
   event: RunEvent;
   actorType: "system" | "agent" | "maintainer" | "operator" | "github";
   actorId: string;
+}
+
+export interface RunTransitionResult {
+  previousState: RunState;
+  state: RunState;
+  pilotId: string;
+  condition: Condition;
 }
 
 export class ExecutionRepository {
   constructor(private readonly database: Database) {}
 
   async transition(input: RunTransitionInput): Promise<RunState> {
-    return this.database.sql.begin((transaction) => this.transitionTx(transaction, input));
+    const result = await this.database.sql.begin((transaction) => this.transitionDetailedTx(transaction, input));
+    return result.state;
   }
 
   async transitionTx(transaction: SqlTransaction, input: RunTransitionInput): Promise<RunState> {
-    const [run] = await transaction<{ state: RunState }[]>`
-      SELECT state
+    return (await this.transitionDetailedTx(transaction, input)).state;
+  }
+
+  /**
+   * The pilot and the condition are read from the locked run row, never accepted from the caller.
+   * A caller that could name them could attribute one run's governance event to another pilot, or
+   * drive the reducer down the wrong condition's branch.
+   */
+  async transitionDetailedTx(transaction: SqlTransaction, input: RunTransitionInput): Promise<RunTransitionResult> {
+    const [run] = await transaction<{ state: RunState; pilot_id: string; condition: Condition }[]>`
+      SELECT state, pilot_id, condition
       FROM runs
       WHERE id = ${input.runId}::uuid
       FOR UPDATE
     `;
     if (!run) throw new Error("Run not found");
-    const next = reduceRunState(run.state, input.event, input.condition);
+    const next = reduceRunState(run.state, input.event, run.condition);
     await transaction`SELECT set_config('roadmapos.allow_run_state_transition', 'on', true)`;
     await transaction`
       UPDATE runs
@@ -37,13 +52,13 @@ export class ExecutionRepository {
     `;
     await transaction`SELECT set_config('roadmapos.allow_run_state_transition', 'off', true)`;
     await appendAuditEventTx(transaction, {
-      pilotId: input.pilotId,
+      pilotId: run.pilot_id,
       eventType: `run.${input.event.type}`,
       actorType: input.actorType,
       actorId: input.actorId,
       payload: { runId: input.runId, previousState: run.state, nextState: next, event: input.event }
     });
-    return next;
+    return { previousState: run.state, state: next, pilotId: run.pilot_id, condition: run.condition };
   }
 
   async activeApprovalCount(requestType: "execution_plan" | "escalation", requestId: string): Promise<number> {
