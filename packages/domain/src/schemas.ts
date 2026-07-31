@@ -103,7 +103,12 @@ export const CheckpointPackageSchema = z.object({
 });
 export type CheckpointPackage = z.infer<typeof CheckpointPackageSchema>;
 
-export const JudgmentClassificationSchema = z.object({
+/**
+ * The plain object shape of a judgment classification, without the cross-field boundary rules.
+ * Structured-output providers can only be handed an object schema, so this is what the model sees;
+ * `JudgmentClassificationSchema` below remains the authoritative parser for every recorded value.
+ */
+export const JudgmentClassificationObjectSchema = z.object({
   boundary: BoundarySchema,
   planRelationship: PlanRelationshipSchema,
   decision: JudgmentDecisionSchema,
@@ -112,7 +117,9 @@ export const JudgmentClassificationSchema = z.object({
   requiredDisclosureFields: z.array(z.string()),
   reversible: z.boolean(),
   confidence: z.number().int().min(0).max(100)
-}).superRefine((value, context) => {
+});
+
+export const JudgmentClassificationSchema = JudgmentClassificationObjectSchema.superRefine((value, context) => {
   if (value.boundary === "platform_hard_stop" && value.decision !== "stop") {
     context.addIssue({ code: z.ZodIssueCode.custom, path: ["decision"], message: "Platform hard stops require stop" });
   }
