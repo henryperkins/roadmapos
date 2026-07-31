@@ -15,7 +15,11 @@ describe("pilot routes", () => {
       auditorTokenSha256: "b49f425a7e1f9cff3856329ada223f2f9d368f15a00cf48df16ca95986137fe8",
       artifactEncryptionKeyBase64: Buffer.alloc(32, 1).toString("base64"),
       pilotLinkSecret: "link-secret-value",
-      publicBaseUrl: "http://localhost:3000"
+      publicBaseUrl: "http://localhost:3000",
+      githubAppId: "1",
+      githubPrivateKeyBase64: Buffer.from("private-key").toString("base64"),
+      githubWebhookSecret: "webhook-secret-123",
+      githubReadyLabel: "roadmapos:ready"
     });
     const created = await app.inject({
       method: "POST",
