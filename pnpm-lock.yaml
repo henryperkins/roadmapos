@@ -38,6 +38,9 @@ importers:
       '@fastify/sensible':
         specifier: ^6.0.4
         version: 6.0.4
+      '@roadmapos/agent':
+        specifier: workspace:*
+        version: link:../../packages/agent
       '@roadmapos/db':
         specifier: workspace:*
         version: link:../../packages/db
@@ -50,6 +53,9 @@ importers:
       '@roadmapos/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@roadmapos/runner':
+        specifier: workspace:*
+        version: link:../../packages/runner
       drizzle-orm:
         specifier: ^0.45.2
         version: 0.45.2(postgres@3.4.9)
@@ -145,15 +151,24 @@ importers:
 
   packages/testkit:
     dependencies:
+      '@roadmapos/agent':
+        specifier: workspace:*
+        version: link:../agent
       '@roadmapos/db':
         specifier: workspace:*
         version: link:../db
       '@roadmapos/domain':
         specifier: workspace:*
         version: link:../domain
+      '@roadmapos/github':
+        specifier: workspace:*
+        version: link:../github
       '@roadmapos/policy':
         specifier: workspace:*
         version: link:../policy
+      '@roadmapos/runner':
+        specifier: workspace:*
+        version: link:../runner
       postgres:
         specifier: ^3.4.9
         version: 3.4.9
