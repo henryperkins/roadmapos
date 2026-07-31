@@ -89,9 +89,28 @@ describe("OctokitGitHubGateway", () => {
     expect(created).toEqual({ id: "900", number: 12, nodeId: "PR_12", url: "https://github.test/pull/12" });
   });
 
-  it("treats a missing branch protection as absent instead of failing", async () => {
+  it("reports a 404 as indeterminate when the installation cannot read protection", async () => {
     const record = await gateway().getBranchProtection({ installationId: "55", owner: "acme", repo: "widget", branch: "main" });
-    expect(record).toEqual({ enabled: false, requiredApprovals: 0 });
+    expect(record.determinacy).toBe("indeterminate");
+    expect(record.reason).toContain("Administration: read");
+  });
+
+  it("reports a 404 as authoritatively unprotected when the installation can read protection", async () => {
+    routes.set("POST /app/installations/55/access_tokens", {
+      status: 201,
+      body: { ...installationToken, permissions: { administration: "read" } }
+    });
+    const record = await gateway().getBranchProtection({ installationId: "55", owner: "acme", repo: "widget", branch: "main" });
+    expect(record).toEqual({ enabled: false, requiredApprovals: 0, determinacy: "authoritative" });
+  });
+
+  it("reports an existing protection authoritatively", async () => {
+    routes.set("GET /repos/acme/widget/branches/main/protection", {
+      status: 200,
+      body: { required_pull_request_reviews: { required_approving_review_count: 2 } }
+    });
+    const record = await gateway().getBranchProtection({ installationId: "55", owner: "acme", repo: "widget", branch: "main" });
+    expect(record).toEqual({ enabled: true, requiredApprovals: 2, determinacy: "authoritative" });
   });
 
   it("decodes file contents and rejects a directory", async () => {

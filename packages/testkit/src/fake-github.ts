@@ -73,6 +73,6 @@ export class FakeGitHubGateway implements GitHubGateway, GitHubCredentialProvide
   }
 
   async getBranchProtection(): Promise<BranchProtectionRecord> {
-    return this.fixture.branchProtection ?? { enabled: true, requiredApprovals: 1 };
+    return this.fixture.branchProtection ?? { enabled: true, requiredApprovals: 1, determinacy: "authoritative" };
   }
 }

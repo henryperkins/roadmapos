@@ -79,14 +79,40 @@ export class OctokitGitHubGateway implements GitHubGateway, GitHubCredentialProv
     return Buffer.from(response.data.content, response.data.encoding as BufferEncoding).toString("utf8");
   }
 
+  /**
+   * Reading branch protection needs the Administration: read permission, which the pilot's App
+   * holds while holding no administration write scope. Without it GitHub answers 404 — the same
+   * status it uses for an unprotected branch — so a 404 is reported as indeterminate unless the
+   * installation is known to have the permission. The caller decides what to do with that; this
+   * gateway will not guess "unprotected".
+   */
   async getBranchProtection(input: BranchProtectionQuery): Promise<BranchProtectionRecord> {
     const octokit = await this.client(input.installationId);
     try {
       const response = await octokit.rest.repos.getBranchProtection({ owner: input.owner, repo: input.repo, branch: input.branch });
-      return { enabled: true, requiredApprovals: response.data.required_pull_request_reviews?.required_approving_review_count ?? 0 };
+      return {
+        enabled: true,
+        requiredApprovals: response.data.required_pull_request_reviews?.required_approving_review_count ?? 0,
+        determinacy: "authoritative"
+      };
     } catch (error) {
-      if (error instanceof Error && "status" in error && (error as Error & { status: number }).status === 404) return { enabled: false, requiredApprovals: 0 };
-      throw error;
+      const status = error instanceof Error && "status" in error ? (error as Error & { status: number }).status : 0;
+      if (status !== 404) throw error;
+      const canRead = await this.hasAdministrationRead(input.installationId);
+      if (canRead) return { enabled: false, requiredApprovals: 0, determinacy: "authoritative" };
+      return {
+        enabled: false,
+        requiredApprovals: 0,
+        determinacy: "indeterminate",
+        reason: "The installation lacks Administration: read, so an unprotected branch cannot be distinguished from an unreadable one"
+      };
     }
+  }
+
+  private async hasAdministrationRead(installationId: string): Promise<boolean> {
+    const auth = createAppAuth({ appId: this.appId, privateKey: this.privateKey, installationId: Number(installationId) });
+    const installation = await auth({ type: "installation" });
+    const permissions = (installation as { permissions?: Record<string, string> }).permissions ?? {};
+    return permissions.administration === "read" || permissions.administration === "write";
   }
 }

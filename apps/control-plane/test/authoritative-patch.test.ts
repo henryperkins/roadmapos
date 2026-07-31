@@ -155,3 +155,39 @@ describe("policy decisions derive from the patch, not its description", () => {
     expect(runner.appliedPatches).toHaveLength(0);
   });
 });
+
+it("refuses to freeze a checkpoint when branch protection cannot be read authoritatively", async () => {
+  const fixture = await seedExecutionFixture(database, { condition: "governed_orchestration", runState: "proposing_action" });
+  const github = new FakeGitHubGateway({
+    permission: "maintain",
+    branchHead: fixture.baseSha,
+    branchProtection: { enabled: false, requiredApprovals: 0, determinacy: "indeterminate", reason: "no Administration: read" }
+  });
+  const planId = crypto.randomUUID();
+  await database.sql`
+    INSERT INTO execution_plans (id, run_id, version, plan_json, content_hash, base_sha, change_classification)
+    VALUES (${planId}::uuid, ${fixture.runId}::uuid, 1, ${JSON.stringify(fixture.planDraft)}::jsonb, ${"d".repeat(64)}, ${fixture.baseSha}, 'initial')
+  `;
+  await database.sql`UPDATE runs SET current_plan_id = ${planId}::uuid WHERE id = ${fixture.runId}::uuid`;
+  const action: ActionProposal = {
+    kind: "apply_patch",
+    patch: patchFor("src/a.ts"),
+    summary: "Update A",
+    affectedPaths: ["src/a.ts"],
+    discoveredFacts: ["A needs updating"],
+    changesPublicInterface: false,
+    changesDependencies: false,
+    changesSecurityBehavior: false
+  };
+  const agent = new DeterministicFakeAgentGateway(fixture.planDraft, [action], fixture.classifier);
+  const checkpoints = new CheckpointService(database, agent, Buffer.alloc(32, 42).toString("base64"));
+  const runner = new FakeWorkspaceRunner();
+  const coordinator = new ActionCoordinator(
+    database, agent, checkpoints, runner, github, fixture.publicBaseUrl,
+    new WorkspaceService(database, github, runner), new ApprovalService(database, github)
+  );
+
+  await expect(coordinator.propose(fixture.runId)).rejects.toThrow("could not be read authoritatively");
+  const frozen = await database.db.select().from(governanceCheckpoints).where(eq(governanceCheckpoints.runId, fixture.runId));
+  expect(frozen).toHaveLength(0);
+});

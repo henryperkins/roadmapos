@@ -146,6 +146,13 @@ export class ActionCoordinator {
     }
     const policy = record.policy.policyJson as RepositoryPolicy;
     const protection = await this.github.getBranchProtection({ installationId: record.repository.installationId.toString(), owner: record.repository.owner, repo: record.repository.name, branch: record.repository.defaultBranch });
+    if (protection.determinacy === "indeterminate") {
+      // Repository protections are one input to the frozen effective policy. If they cannot be read
+      // authoritatively the checkpoint would be frozen over a guess, so the action is refused.
+      throw new Error(
+        `Branch protection for ${record.repository.owner}/${record.repository.name}@${record.repository.defaultBranch} could not be read authoritatively: ${protection.reason ?? "unknown reason"}`
+      );
+    }
     const effective = buildEffectivePolicy(policy, { branchProtectionEnabled: protection.enabled, requiredApprovals: protection.requiredApprovals });
     // Derived from the diff, not from the model's description of it. A discrepancy rejects the
     // proposal outright rather than freezing a checkpoint over a false account of the change.

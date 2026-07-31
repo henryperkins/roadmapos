@@ -23,7 +23,18 @@ export interface RepositoryFileQuery {
 }
 
 export type BranchProtectionQuery = BranchHeadQuery;
-export interface BranchProtectionRecord { enabled: boolean; requiredApprovals: number }
+
+/**
+ * `indeterminate` is a distinct outcome, not a synonym for unprotected. GitHub answers 404 both for
+ * "this branch has no protection" and for "this installation may not read protection", so a
+ * gateway that cannot tell them apart must say so rather than assert the permissive reading.
+ */
+export interface BranchProtectionRecord {
+  enabled: boolean;
+  requiredApprovals: number;
+  determinacy: "authoritative" | "indeterminate";
+  reason?: string;
+}
 
 export interface IssueCommentInput {
   installationId: string;
