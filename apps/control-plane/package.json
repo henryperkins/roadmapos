@@ -16,7 +16,10 @@
     "@roadmapos/policy": "workspace:*",
     "drizzle-orm": "^0.45.2",
     "fastify": "^5.10.0",
-    "zod": "^3.25.76"
+    "zod": "^3.25.76",
+    "@roadmapos/github": "workspace:*",
+    "@roadmapos/agent": "workspace:*",
+    "@roadmapos/runner": "workspace:*"
   },
   "devDependencies": {
     "@roadmapos/testkit": "workspace:*"

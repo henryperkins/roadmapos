@@ -1,0 +1,150 @@
+import { createHash, createHmac } from "node:crypto";
+import { beforeEach, expect, it } from "vitest";
+import { createDatabase, jobs } from "@roadmapos/db";
+import { eq } from "drizzle-orm";
+import { resetTestDatabase } from "@roadmapos/testkit";
+import { buildApp } from "../src/app.js";
+
+const url = process.env.TEST_DATABASE_URL;
+if (!url) throw new Error("TEST_DATABASE_URL is required");
+
+beforeEach(async () => resetTestDatabase(url));
+
+const secret = "webhook-secret-123";
+
+function config(databaseUrl: string) {
+  return {
+    databaseUrl,
+    adminTokenSha256: createHash("sha256").update("admin-bootstrap", "utf8").digest("hex"),
+    artifactEncryptionKeyBase64: Buffer.alloc(32, 1).toString("base64"),
+    pilotLinkSecret: "pilot-link-secret-123",
+    publicBaseUrl: "http://localhost:3000",
+    githubAppId: "1",
+    githubPrivateKeyBase64: Buffer.from("private-key").toString("base64"),
+    githubWebhookSecret: secret,
+    githubReadyLabel: "roadmapos:ready"
+  };
+}
+
+it("accepts one signed delivery and treats the repeated delivery id as a duplicate", async () => {
+  const body = Buffer.from(JSON.stringify({
+    action: "labeled",
+    label: { name: "roadmapos:ready" },
+    repository: { id: 1, name: "widget", owner: { login: "acme" } },
+    issue: { number: 17 }
+  }));
+  const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
+  const app = await buildApp(config(url));
+  const headers = {
+    "content-type": "application/json",
+    "x-github-delivery": "delivery-1",
+    "x-github-event": "issues",
+    "x-hub-signature-256": signature
+  };
+  const first = await app.inject({ method: "POST", url: "/github/webhooks", headers, payload: body });
+  const second = await app.inject({ method: "POST", url: "/github/webhooks", headers, payload: body });
+  expect(first.statusCode).toBe(202);
+  expect(first.json()).toEqual({ accepted: true });
+  expect(second.statusCode).toBe(202);
+  expect(second.json()).toEqual({ duplicate: true });
+
+  const database = createDatabase(url);
+  const queued = await database.db.select().from(jobs).where(eq(jobs.jobType, "github.webhook"));
+  expect(queued).toHaveLength(1);
+  await database.close();
+  await app.close();
+});
+
+it("rejects an unsigned or tampered delivery without recording it", async () => {
+  const body = Buffer.from(JSON.stringify({ action: "labeled" }));
+  const app = await buildApp(config(url));
+  const unsigned = await app.inject({
+    method: "POST",
+    url: "/github/webhooks",
+    headers: { "content-type": "application/json", "x-github-delivery": "delivery-2", "x-github-event": "issues" },
+    payload: body
+  });
+  expect(unsigned.statusCode).toBe(401);
+
+  const wrongSignature = `sha256=${createHmac("sha256", "other-secret").update(body).digest("hex")}`;
+  const tampered = await app.inject({
+    method: "POST",
+    url: "/github/webhooks",
+    headers: { "content-type": "application/json", "x-github-delivery": "delivery-3", "x-github-event": "issues", "x-hub-signature-256": wrongSignature },
+    payload: body
+  });
+  expect(tampered.statusCode).toBe(401);
+
+  const database = createDatabase(url);
+  const queued = await database.db.select().from(jobs).where(eq(jobs.jobType, "github.webhook"));
+  expect(queued).toHaveLength(0);
+  await database.close();
+  await app.close();
+});
+
+it("still parses JSON on the internal API after installing the raw webhook parser", async () => {
+  const app = await buildApp(config(url));
+  const created = await app.inject({
+    method: "POST",
+    url: "/internal/pilots",
+    headers: { authorization: "Bearer admin-bootstrap" },
+    payload: { name: "Pilot A" }
+  });
+  expect(created.statusCode).toBe(201);
+  await app.close();
+});
+
+it("rejects a repeated delivery id that carries different content", async () => {
+  const first = Buffer.from(JSON.stringify({ action: "labeled", label: { name: "roadmapos:ready" } }));
+  const second = Buffer.from(JSON.stringify({ action: "labeled", label: { name: "something-else" } }));
+  const app = await buildApp(config(url));
+  const headers = (body: Buffer) => ({
+    "content-type": "application/json",
+    "x-github-delivery": "delivery-reused",
+    "x-github-event": "issues",
+    "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`
+  });
+
+  expect((await app.inject({ method: "POST", url: "/github/webhooks", headers: headers(first), payload: first })).statusCode).toBe(202);
+  const conflicting = await app.inject({ method: "POST", url: "/github/webhooks", headers: headers(second), payload: second });
+  expect(conflicting.statusCode).toBe(409);
+  await app.close();
+});
+
+it("records the delivery and its job atomically, so a crashed enqueue loses neither", async () => {
+  const database = createDatabase(url);
+  const body = Buffer.from(JSON.stringify({ action: "labeled", label: { name: "roadmapos:ready" } }));
+  const payloadHash = createHash("sha256").update(body.toString("utf8"), "utf8").digest("hex");
+
+  // A crash inside the transaction must leave neither the delivery nor the job behind.
+  await expect(database.sql.begin(async (transaction) => {
+    await transaction`
+      INSERT INTO github_deliveries (delivery_id, event_name, payload_hash)
+      VALUES ('delivery-crash', 'issues', ${payloadHash})
+    `;
+    throw new Error("worker crashed between receipt and dispatch");
+  })).rejects.toThrow("worker crashed");
+
+  const deliveries = await database.sql`SELECT delivery_id FROM github_deliveries WHERE delivery_id = 'delivery-crash'`;
+  expect(deliveries).toHaveLength(0);
+
+  // GitHub's redelivery is therefore accepted rather than dismissed as a duplicate.
+  const app = await buildApp(config(url));
+  const replay = await app.inject({
+    method: "POST",
+    url: "/github/webhooks",
+    headers: {
+      "content-type": "application/json",
+      "x-github-delivery": "delivery-crash",
+      "x-github-event": "issues",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`
+    },
+    payload: body
+  });
+  expect(replay.statusCode).toBe(202);
+  expect(replay.json()).toEqual({ accepted: true });
+  const queued = await database.db.select().from(jobs).where(eq(jobs.jobType, "github.webhook"));
+  expect(queued).toHaveLength(1);
+  await app.close();
+  await database.close();
+});
