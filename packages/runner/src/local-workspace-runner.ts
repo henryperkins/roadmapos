@@ -7,7 +7,7 @@ import { runProcess } from "./process.js";
 import { assertReadablePath } from "./safe-path.js";
 import type { CommitResult, PatchResult, ReadonlyFile, ValidationResult, WorkspaceHandle, WorkspaceRequest, WorkspaceRunner } from "./types.js";
 import type { DockerCommandExecutor } from "./docker-executor.js";
-import { assertGitStateAuthorized, readGitState } from "./workspace-guard.js";
+import { assertContainedRealPath, assertGitStateAuthorized, readGitState } from "./workspace-guard.js";
 
 /**
  * Hands git a token through a single-use askpass helper. The token never reaches argv, a remote
@@ -49,7 +49,15 @@ export class LocalWorkspaceRunner implements WorkspaceRunner {
   constructor(private readonly root: string, private readonly docker: DockerCommandExecutor) {}
 
   async prepare(input: WorkspaceRequest): Promise<WorkspaceHandle> {
+    // Opaque, strictly-parsed identifier: `resolve(root, runId)` with an unvalidated runId can
+    // escape the workspace root, and this path is about to be recursively deleted.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.runId)) {
+      throw new Error(`Run identifier is not a UUID: ${input.runId}`);
+    }
     const workspace = resolve(this.root, input.runId);
+    if (workspace !== join(resolve(this.root), input.runId)) {
+      throw new Error(`Workspace path escapes the runner root: ${input.runId}`);
+    }
     const handle: WorkspaceHandle = {
       runId: input.runId,
       root: workspace,
@@ -73,6 +81,9 @@ export class LocalWorkspaceRunner implements WorkspaceRunner {
       );
     }
 
+    // Asserted before a recursive delete: a symlinked component would otherwise let the delete
+    // reach outside the runner root entirely.
+    if (await pathExists(workspace)) await assertContainedRealPath(this.root, workspace);
     await rm(workspace, { recursive: true, force: true });
     await withGitCredential(input.installationToken, async (env) => {
       const clone = await runProcess({ executable: "git", args: ["clone", "--no-checkout", input.cloneUrl, workspace], env, timeoutMs: 120_000, redactions: [input.installationToken] });
@@ -93,7 +104,9 @@ export class LocalWorkspaceRunner implements WorkspaceRunner {
     for (const candidate of paths) {
       const path = assertReadablePath(candidate, handle.readablePaths);
       const absolute = resolve(handle.root, path);
-      if (!absolute.startsWith(`${resolve(handle.root)}/`)) throw new Error(`Unsafe absolute path: ${path}`);
+      // Every component is resolved, not just the leaf: a lexical prefix check passes for
+      // `src/link/secret` where `src/link` is a symlink pointing out of the workspace.
+      await assertContainedRealPath(handle.root, absolute);
       const stat = await lstat(absolute);
       if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Path is not a regular file: ${path}`);
       if (stat.size > 200_000) throw new Error(`File exceeds 200 KB: ${path}`);

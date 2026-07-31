@@ -61,9 +61,11 @@ afterEach(async () => {
   await rm(scratch, { recursive: true, force: true });
 });
 
-function request(branchName = "roadmapos/run-1") {
+const RUN_ID = "4f8f8ec8-8fea-4ccf-9a12-79080e2dd0d8";
+
+function request(branchName = `roadmapos/${RUN_ID}`) {
   return {
-    runId: "run-1",
+    runId: RUN_ID,
     cloneUrl: bareRepo,
     installationToken: TOKEN,
     baseSha,
@@ -86,10 +88,10 @@ describe("LocalWorkspaceRunner", () => {
 
     const committed = await runner.commitAndPush(handle, "Update a", TOKEN);
     expect(committed.commitSha).toMatch(/^[a-f0-9]{40}$/);
-    expect(committed.branchName).toBe("roadmapos/run-1");
+    expect(committed.branchName).toBe(`roadmapos/${RUN_ID}`);
     expect(JSON.stringify(committed)).not.toContain(TOKEN);
 
-    const pushed = await runProcess({ executable: "git", args: ["--git-dir", bareRepo, "rev-parse", "roadmapos/run-1"], timeoutMs: 30_000 });
+    const pushed = await runProcess({ executable: "git", args: ["--git-dir", bareRepo, "rev-parse", `roadmapos/${RUN_ID}`], timeoutMs: 30_000 });
     expect(pushed.stdout.trim()).toBe(committed.commitSha);
   });
 
@@ -210,5 +212,47 @@ describe("validation isolation and privileged Git guards", () => {
     const restarted = new LocalWorkspaceRunner(workspaceRoot, docker);
     await expect(restarted.commitAndPush(handle, "Update a", TOKEN))
       .rejects.toThrow("refusing a privileged Git operation");
+  });
+});
+
+describe("containment and process limits", () => {
+  it("refuses a run identifier that is not an opaque UUID", async () => {
+    const runner = new LocalWorkspaceRunner(workspaceRoot, docker);
+    await expect(runner.prepare({ ...request(), runId: "../escape" })).rejects.toThrow("not a UUID");
+    await expect(runner.prepare({ ...request(), runId: "run-1/../../etc" })).rejects.toThrow("not a UUID");
+  });
+
+  it("refuses a read whose parent component is a symlink out of the workspace", async () => {
+    const runner = new LocalWorkspaceRunner(workspaceRoot, docker);
+    const handle = await runner.prepare(request());
+    const outside = join(scratch, "outside");
+    await runProcess({ executable: "mkdir", args: ["-p", outside], timeoutMs: 10_000 });
+    await writeFile(join(outside, "secret.ts"), "secret\n", "utf8");
+    await runProcess({ executable: "ln", args: ["-s", outside, join(handle.root, "src", "link")], timeoutMs: 10_000 });
+
+    await expect(runner.readFiles(handle, ["src/link/secret.ts"])).rejects.toThrow("escapes the workspace");
+  });
+
+  it("bounds captured output instead of buffering without limit", async () => {
+    const result = await runProcess({
+      executable: "sh",
+      args: ["-c", "yes roadmapos | head -c 200000"],
+      timeoutMs: 30_000,
+      maxOutputBytes: 4096
+    });
+    expect(result.stdout.length).toBeLessThan(20_000);
+    expect(result.stdout).toContain("[output truncated at 4096 bytes]");
+  });
+
+  it("terminates the whole process group on timeout rather than only the direct child", async () => {
+    const started = Date.now();
+    const result = await runProcess({
+      executable: "sh",
+      args: ["-c", "sleep 30 & sleep 30"],
+      timeoutMs: 700
+    });
+    expect(result.exitCode).toBe(124);
+    expect(result.stderr).toContain("terminated after 700 ms");
+    expect(Date.now() - started).toBeLessThan(10_000);
   });
 });
