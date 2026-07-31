@@ -13,6 +13,7 @@
   "dependencies": {
     "@roadmapos/db": "workspace:*",
     "@roadmapos/domain": "workspace:*",
-    "postgres": "^3.4.9"
+    "postgres": "^3.4.9",
+    "@roadmapos/policy": "workspace:*"
   }
 }

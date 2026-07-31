@@ -96,3 +96,168 @@ export const jobs = pgTable("jobs", {
   createdAt,
   completedAt: timestamp("completed_at", { withTimezone: true })
 }, (table) => [index("jobs_claim_idx").on(table.status, table.availableAt, table.createdAt)]);
+
+export const runs = pgTable("runs", {
+  id: uuid("id").primaryKey(),
+  pilotId: uuid("pilot_id").notNull().references(() => pilotStudies.id),
+  workItemId: uuid("work_item_id").notNull().references(() => workItems.id),
+  repositoryId: uuid("repository_id").notNull().references(() => repositories.id),
+  policyVersionId: uuid("policy_version_id").notNull().references(() => repositoryPolicyVersions.id),
+  condition: text("condition").notNull(),
+  state: text("state").notNull(),
+  baseSha: char("base_sha", { length: 40 }).notNull(),
+  branchName: text("branch_name").notNull(),
+  currentPlanId: uuid("current_plan_id"),
+  terminationReason: text("termination_reason"),
+  terminalAt: timestamp("terminal_at", { withTimezone: true }),
+  createdAt,
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+});
+
+export const executionPlans = pgTable("execution_plans", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  version: integer("version").notNull(),
+  planJson: jsonb("plan_json").notNull(),
+  contentHash: char("content_hash", { length: 64 }).notNull(),
+  baseSha: char("base_sha", { length: 40 }).notNull(),
+  supersedesPlanId: uuid("supersedes_plan_id"),
+  changeClassification: text("change_classification"),
+  createdAt
+});
+
+export const approvals = pgTable("approvals", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  requestType: text("request_type").notNull(),
+  requestId: uuid("request_id").notNull(),
+  requestVersion: integer("request_version").notNull(),
+  requestHash: char("request_hash", { length: 64 }).notNull(),
+  githubUserId: bigint("github_user_id", { mode: "bigint" }).notNull(),
+  githubLogin: text("github_login").notNull(),
+  repositoryPermission: text("repository_permission").notNull(),
+  policyVersionId: uuid("policy_version_id").notNull().references(() => repositoryPolicyVersions.id),
+  baseSha: char("base_sha", { length: 40 }).notNull(),
+  githubCommentId: bigint("github_comment_id", { mode: "bigint" }).notNull(),
+  createdAt
+});
+
+export const approvalInvalidations = pgTable("approval_invalidations", {
+  id: uuid("id").primaryKey(),
+  approvalId: uuid("approval_id").notNull().references(() => approvals.id),
+  reason: text("reason").notNull(),
+  invalidatedByEventId: uuid("invalidated_by_event_id").notNull().references(() => pilotEvents.id),
+  createdAt
+});
+
+export const explicitInstructions = pgTable("explicit_instructions", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  version: integer("version").notNull(),
+  instructionText: text("instruction_text").notNull(),
+  contentHash: char("content_hash", { length: 64 }).notNull(),
+  githubUserId: bigint("github_user_id", { mode: "bigint" }).notNull(),
+  githubCommentId: bigint("github_comment_id", { mode: "bigint" }).notNull(),
+  repositoryPermission: text("repository_permission").notNull(),
+  createdAt
+});
+
+export const actionProposals = pgTable("action_proposals", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  sequence: integer("sequence").notNull(),
+  actionJson: jsonb("action_json").notNull(),
+  actionHash: char("action_hash", { length: 64 }).notNull(),
+  status: text("status").notNull(),
+  createdAt,
+  executedAt: timestamp("executed_at", { withTimezone: true })
+});
+
+export const governanceCheckpoints = pgTable("governance_checkpoints", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  actionProposalId: uuid("action_proposal_id").references(() => actionProposals.id),
+  source: text("source").notNull(),
+  packageJson: jsonb("package_json").notNull(),
+  packageHash: char("package_hash", { length: 64 }).notNull(),
+  createdAt
+});
+
+export const judgmentClassifications = pgTable("judgment_classifications", {
+  id: uuid("id").primaryKey(),
+  checkpointId: uuid("checkpoint_id").notNull().references(() => governanceCheckpoints.id),
+  actorType: text("actor_type").notNull(),
+  sealedPayload: jsonb("sealed_payload").notNull(),
+  payloadHash: char("payload_hash", { length: 64 }).notNull(),
+  submittedAt: timestamp("submitted_at", { withTimezone: true }).notNull().defaultNow()
+});
+
+export const judgmentComparisons = pgTable("judgment_comparisons", {
+  id: uuid("id").primaryKey(),
+  checkpointId: uuid("checkpoint_id").notNull().references(() => governanceCheckpoints.id),
+  agentPayload: jsonb("agent_payload").notNull(),
+  operatorPayload: jsonb("operator_payload").notNull(),
+  decisionAgreement: boolean("decision_agreement").notNull(),
+  boundaryAgreement: boolean("boundary_agreement").notNull(),
+  unsafeFalseNegative: boolean("unsafe_false_negative").notNull(),
+  conservativeFalsePositive: boolean("conservative_false_positive").notNull(),
+  createdAt
+});
+
+export const liveGateDecisions = pgTable("live_gate_decisions", {
+  id: uuid("id").primaryKey(),
+  checkpointId: uuid("checkpoint_id").notNull().references(() => governanceCheckpoints.id),
+  operatorDecision: text("operator_decision").notNull(),
+  rationale: text("rationale").notNull(),
+  createdAt
+});
+
+export const escalations = pgTable("escalations", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  checkpointId: uuid("checkpoint_id").notNull().references(() => governanceCheckpoints.id),
+  version: integer("version").notNull(),
+  escalationJson: jsonb("escalation_json").notNull(),
+  contentHash: char("content_hash", { length: 64 }).notNull(),
+  status: text("status").notNull(),
+  createdAt
+});
+
+export const deviations = pgTable("deviations", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  checkpointId: uuid("checkpoint_id").notNull().references(() => governanceCheckpoints.id),
+  disclosureJson: jsonb("disclosure_json").notNull(),
+  contentHash: char("content_hash", { length: 64 }).notNull(),
+  createdAt
+});
+
+export const draftPullRequests = pgTable("draft_pull_requests", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  githubPullRequestId: bigint("github_pull_request_id", { mode: "bigint" }).notNull(),
+  number: integer("number").notNull(),
+  htmlUrl: text("html_url").notNull(),
+  headSha: char("head_sha", { length: 40 }).notNull(),
+  bodyHash: char("body_hash", { length: 64 }).notNull(),
+  createdAt
+});
+
+export const runTranscriptEntries = pgTable("run_transcript_entries", {
+  id: uuid("id").primaryKey(),
+  runId: uuid("run_id").notNull().references(() => runs.id),
+  sequence: integer("sequence").notNull(),
+  role: text("role").notNull(),
+  content: text("content").notNull(),
+  contentHash: char("content_hash", { length: 64 }).notNull(),
+  createdAt
+});
+
+export const githubDeliveries = pgTable("github_deliveries", {
+  deliveryId: text("delivery_id").primaryKey(),
+  eventName: text("event_name").notNull(),
+  payloadHash: char("payload_hash", { length: 64 }).notNull(),
+  receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  processedAt: timestamp("processed_at", { withTimezone: true }),
+  processingError: text("processing_error")
+});
