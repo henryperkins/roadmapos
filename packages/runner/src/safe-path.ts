@@ -1,13 +1,7 @@
-import { posix } from "node:path";
 import { minimatch } from "minimatch";
+import { normalizeRepositoryPath } from "@roadmapos/domain";
 
-export function normalizeRepositoryPath(value: string): string {
-  const normalized = posix.normalize(value.replaceAll("\\", "/"));
-  if (normalized.startsWith("/") || normalized === ".." || normalized.startsWith("../") || normalized.includes("/../") || normalized === ".git" || normalized.startsWith(".git/")) {
-    throw new Error(`Unsafe repository path: ${value}`);
-  }
-  return normalized;
-}
+export { normalizeRepositoryPath };
 
 export function assertReadablePath(value: string, patterns: string[]): string {
   const normalized = normalizeRepositoryPath(value);

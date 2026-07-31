@@ -25,10 +25,10 @@ import {
   workItems,
   type Database
 } from "@roadmapos/db";
-import { sha256Canonical, sha256Text, type ActionContext, type ActionProposal, type CheckpointPackage, type Condition } from "@roadmapos/domain";
+import { derivePatchFacts, sha256Canonical, sha256Text, type ActionContext, type ActionProposal, type CheckpointPackage, type ClaimUnderstatement, type Condition, type DerivedPatchFacts } from "@roadmapos/domain";
 import type { AgentGateway } from "@roadmapos/agent";
 import type { GitHubGateway } from "@roadmapos/github";
-import { buildEffectivePolicy, evaluateAction, type RepositoryPolicy } from "@roadmapos/policy";
+import { buildAuthoritativeAction, buildEffectivePolicy, type RepositoryPolicy } from "@roadmapos/policy";
 import type { WorkspaceRunner } from "@roadmapos/runner";
 import type { CheckpointService } from "./checkpoint-service.js";
 import type { WorkspaceService } from "./workspace-service.js";
@@ -147,7 +147,11 @@ export class ActionCoordinator {
     const policy = record.policy.policyJson as RepositoryPolicy;
     const protection = await this.github.getBranchProtection({ installationId: record.repository.installationId.toString(), owner: record.repository.owner, repo: record.repository.name, branch: record.repository.defaultBranch });
     const effective = buildEffectivePolicy(policy, { branchProtectionEnabled: protection.enabled, requiredApprovals: protection.requiredApprovals });
-    const evaluation = evaluateAction(effective, action);
+    // Derived from the diff, not from the model's description of it. A discrepancy rejects the
+    // proposal outright rather than freezing a checkpoint over a false account of the change.
+    const authoritative = buildAuthoritativeAction(effective, action);
+    const evaluated = authoritative.action;
+    const evaluation = authoritative.evaluation;
     const authorization = explicitAuthorization ?? await this.currentPlanReference(record.run.id);
     const checkpointPackage: CheckpointPackage = {
       schemaVersion: 1,
@@ -156,13 +160,15 @@ export class ActionCoordinator {
       authorization,
       policyEvaluation: evaluation,
       contemplatedAction: {
-        kind: action.kind,
-        summary: this.actionSummary(action),
-        affectedPaths: action.kind === "apply_patch" ? action.affectedPaths : [],
-        ...(action.kind === "apply_patch" ? { patchHash: sha256Text(action.patch) } : {}),
-        ...(action.kind === "run_validation" ? { validationCommandId: action.commandId } : {})
+        kind: evaluated.kind,
+        summary: this.actionSummary(evaluated),
+        affectedPaths: authoritative.derived?.affectedPaths ?? [],
+        ...(authoritative.derived ? { patchHash: authoritative.derived.patchSha256 } : {}),
+        ...(evaluated.kind === "run_validation" ? { validationCommandId: evaluated.commandId } : {})
       },
-      discoveredFacts: action.kind === "apply_patch" ? [...action.discoveredFacts, ...evaluation.matchedRules] : evaluation.matchedRules,
+      discoveredFacts: evaluated.kind === "apply_patch"
+        ? [...evaluated.discoveredFacts, ...evaluation.matchedRules, ...derivedFactNotes(authoritative.derived, authoritative.understatements)]
+        : evaluation.matchedRules,
       validationState: { completedCommandIds: [], failingCommandIds: [] },
       reversible: true,
       createdAt: new Date().toISOString()
@@ -245,7 +251,14 @@ export class ActionCoordinator {
       const { handle, token } = await this.workspaceService.get(runId);
       let resultText: string;
       if (action.kind === "read_files") resultText = JSON.stringify(await this.runner.readFiles(handle, action.paths));
-      else if (action.kind === "apply_patch") resultText = JSON.stringify(await this.runner.applyPatch(handle, action.patch));
+      else if (action.kind === "apply_patch") {
+        const frozenHash = await this.frozenPatchHash(proposalId);
+        const derived = derivePatchFacts(action.patch);
+        if (frozenHash !== null && derived.patchSha256 !== frozenHash) {
+          throw new Error("The patch about to be applied is not the patch the operator cleared");
+        }
+        resultText = JSON.stringify(await this.runner.applyPatch(handle, derived.normalizedPatch));
+      }
       else if (action.kind === "run_validation") resultText = JSON.stringify(await this.runner.runValidation(handle, action.commandId));
       else {
         // The only action here that mutates the remote, so it is recorded as an intended effect
@@ -353,6 +366,16 @@ export class ActionCoordinator {
     return "safe_to_retry";
   }
 
+  /** The patch hash the operator's decision was frozen over, if this proposal has a checkpoint. */
+  private async frozenPatchHash(proposalId: string): Promise<string | null> {
+    const [row] = await this.database.sql<{ patch_hash: string | null }[]>`
+      SELECT package_json #>> '{contemplatedAction,patchHash}' AS patch_hash
+      FROM governance_checkpoints WHERE action_proposal_id = ${proposalId}::uuid
+      ORDER BY created_at DESC LIMIT 1
+    `;
+    return row?.patch_hash ?? null;
+  }
+
   private async loadRun(runId: string) {
     const [record] = await this.database.db.select({
       run: runs,
@@ -421,4 +444,14 @@ export class ActionCoordinator {
       `\`/roadmapos do ${proposalId}\``
     ].join("\n");
   }
+}
+
+/** Records what the diff itself showed, so the operator sees derived facts beside claimed ones. */
+function derivedFactNotes(derived: DerivedPatchFacts | null, understatements: ClaimUnderstatement[]): string[] {
+  if (!derived) return [];
+  const notes: string[] = [];
+  if (derived.touchesDependencyManifest) notes.push(`derived:dependency_manifest_changed:${derived.dependencyManifests.join(",")}`);
+  if (derived.touchesSecuritySensitivePath) notes.push(`derived:security_sensitive_path:${derived.securitySensitivePaths.join(",")}`);
+  for (const item of understatements) notes.push(`derived:understated_effect:${item.field}:${item.derivedEvidence}`);
+  return notes;
 }
