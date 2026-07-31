@@ -1,4 +1,4 @@
-import { createDatabase, claimNextJob, completeJob, failJob } from "@roadmapos/db";
+import { createDatabase, claimNextJob, completeJob, ExecutionRepository, failJob } from "@roadmapos/db";
 import { OctokitGitHubGateway } from "@roadmapos/github";
 import { OpenAIAgentGateway } from "@roadmapos/agent";
 import { DockerCommandExecutor, LocalWorkspaceRunner } from "@roadmapos/runner";
@@ -11,6 +11,8 @@ import { WebhookRouter } from "./services/webhook-router.js";
 import { CheckpointService } from "./services/checkpoint-service.js";
 import { ActionCoordinator } from "./services/action-coordinator.js";
 import { WorkspaceService } from "./services/workspace-service.js";
+import { EscalationService } from "./services/escalation-service.js";
+import { PullRequestService } from "./services/pull-request-service.js";
 
 const config = configFromEnv();
 const database = createDatabase(config.databaseUrl);
@@ -37,10 +39,13 @@ const coordinator = new ActionCoordinator(
   new WorkspaceService(database, github, runner),
   approvalService
 );
+const planService = new PlanService(database, agent, github, new ExecutionRepository(database), checkpointService);
 const dependencies = {
-  planService: new PlanService(database, agent, github),
-  webhookRouter: new WebhookRouter(database, new RunBootstrapService(database, github), approvalService, coordinator),
+  planService,
+  webhookRouter: new WebhookRouter(database, new RunBootstrapService(database, github), approvalService, coordinator, planService),
   coordinator,
+  escalationService: new EscalationService(database, github),
+  pullRequestService: new PullRequestService(database, github),
   readyLabel: config.githubReadyLabel
 };
 

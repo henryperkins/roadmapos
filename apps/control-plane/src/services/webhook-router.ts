@@ -1,11 +1,12 @@
 import { and, desc, eq } from "drizzle-orm";
-import { repositories, repositoryPolicyVersions, runs, workItems, type Database } from "@roadmapos/db";
+import { ExecutionRepository, repositories, repositoryPolicyVersions, runs, workItems, type Database } from "@roadmapos/db";
 import type { RoadmapOsCommand } from "@roadmapos/github";
 import type { Condition } from "@roadmapos/domain";
 import type { GitHubWebhookDependencies, IssueCommentPayload, IssueLabeledPayload } from "../jobs/github-webhook-handler.js";
 import type { RunBootstrapService } from "./run-bootstrap-service.js";
 import type { ApprovalService } from "./approval-service.js";
 import type { ActionCoordinator } from "./action-coordinator.js";
+import type { PlanService } from "./plan-service.js";
 
 export interface ResolvedRunContext {
   runId: string;
@@ -22,7 +23,9 @@ export class WebhookRouter implements GitHubWebhookDependencies {
     private readonly database: Database,
     private readonly bootstrap: RunBootstrapService,
     private readonly approvals: ApprovalService,
-    private readonly coordinator: ActionCoordinator
+    private readonly coordinator: ActionCoordinator,
+    private readonly plans: PlanService,
+    private readonly execution = new ExecutionRepository(database)
   ) {}
 
   async startReadyIssue(payload: IssueLabeledPayload): Promise<void> {
@@ -87,8 +90,42 @@ export class WebhookRouter implements GitHubWebhookDependencies {
       case "authorize_action":
         await this.coordinator.authorizeInteractiveAction({ runId, proposalId: command.proposalId, ...actor });
         return;
-      default:
-        throw new Error(`Command ${command.kind} is not routable yet`);
+      case "revise_plan":
+        await this.plans.revisePlan(runId, command.feedback);
+        return;
+      case "approve_escalation":
+        await this.approvals.approveEscalation({ runId, version: command.version, hashPrefix: command.hashPrefix, ...actor });
+        return;
+      case "reject_escalation":
+        await this.approvals.rejectEscalation({ runId, version: command.version, githubUserId: actor.githubUserId, githubLogin: actor.githubLogin });
+        return;
+      case "review_ready":
+        await this.declareReviewReady(runId, actor.githubUserId);
+        return;
+      case "terminate":
+        await this.terminate(runId, command.reason, actor.githubUserId);
+        return;
     }
+  }
+
+  private async declareReviewReady(runId: string, actorId: string): Promise<void> {
+    const [run] = await this.database.db.select().from(runs).where(eq(runs.id, runId));
+    if (!run) throw new Error("Run not found");
+    await this.execution.transition({
+      runId, pilotId: run.pilotId, condition: run.condition as Condition,
+      event: { type: "review_ready_declared" }, actorType: "maintainer", actorId
+    });
+  }
+
+  private async terminate(runId: string, reason: string, actorId: string): Promise<void> {
+    const [run] = await this.database.db.select().from(runs).where(eq(runs.id, runId));
+    if (!run) throw new Error("Run not found");
+    await this.database.sql.begin(async (transaction) => {
+      await this.execution.transitionTx(transaction, {
+        runId, pilotId: run.pilotId, condition: run.condition as Condition,
+        event: { type: "terminated" }, actorType: "maintainer", actorId
+      });
+      await transaction`UPDATE runs SET termination_reason = ${reason} WHERE id = ${runId}::uuid`;
+    });
   }
 }

@@ -1,12 +1,15 @@
 import { and, eq, isNull } from "drizzle-orm";
 import {
+  actionProposals,
   appendAuditEvent,
   approvalCarryovers,
   approvalInvalidations,
   approvals,
   enqueueJob,
+  escalations,
   executionPlans,
   ExecutionRepository,
+  governanceCheckpoints,
   repositories,
   repositoryPolicyVersions,
   runs,
@@ -245,6 +248,166 @@ export class ApprovalService {
       .leftJoin(approvalInvalidations, eq(approvalInvalidations.approvalId, approvals.id))
       .where(and(eq(approvals.requestType, input.requestType), eq(approvals.requestId, input.requestId), isNull(approvalInvalidations.id)));
     return { distinctEligibleApprovers: new Set(remaining.map((approval) => approval.login)).size, invalidatedLogins };
+  }
+
+  /**
+   * Approves the exact frozen escalation. It never rewrites the operator's original pause: the
+   * `live_gate_decisions` row stays `pause_and_escalate` and the approved escalation becomes a
+   * separate, later authorization source for the same frozen proposal.
+   */
+  async approveEscalation(input: {
+    runId: string;
+    version: number;
+    hashPrefix: string;
+    githubUserId: string;
+    githubLogin: string;
+    githubCommentId: string;
+  }): Promise<{ activeApprovals: number; requiredApprovals: number; quorumReached: boolean; invalidatedApprovals: string[] }> {
+    const [record] = await this.database.db
+      .select({ escalation: escalations, checkpoint: governanceCheckpoints, proposal: actionProposals, run: runs, repository: repositories, policy: repositoryPolicyVersions })
+      .from(escalations)
+      .innerJoin(governanceCheckpoints, eq(governanceCheckpoints.id, escalations.checkpointId))
+      .innerJoin(actionProposals, eq(actionProposals.id, governanceCheckpoints.actionProposalId))
+      .innerJoin(runs, eq(runs.id, escalations.runId))
+      .innerJoin(repositories, eq(repositories.id, runs.repositoryId))
+      .innerJoin(repositoryPolicyVersions, eq(repositoryPolicyVersions.id, runs.policyVersionId))
+      .where(and(eq(escalations.runId, input.runId), eq(escalations.version, input.version)));
+    if (!record) throw new Error("Escalation version not found");
+    if (record.escalation.status === "rejected") throw new Error("Escalation is rejected");
+    if (!record.escalation.contentHash.startsWith(input.hashPrefix)) throw new Error("Escalation hash prefix does not match");
+
+    const policy = record.policy.policyJson as RepositoryPolicy;
+    const permission = await this.github.getRepositoryPermission({
+      installationId: record.repository.installationId.toString(),
+      owner: record.repository.owner,
+      repo: record.repository.name,
+      login: input.githubLogin
+    });
+    if (!meetsPermission(permission, policy.authorization.minimumApprovalRole)) {
+      throw new Error(`Escalation approval requires ${policy.authorization.minimumApprovalRole} permission`);
+    }
+
+    const inserted = await this.database.db.insert(approvals).values({
+      id: crypto.randomUUID(),
+      runId: input.runId,
+      requestType: "escalation",
+      requestId: record.escalation.id,
+      requestVersion: record.escalation.version,
+      requestHash: record.escalation.contentHash,
+      githubUserId: BigInt(input.githubUserId),
+      githubLogin: input.githubLogin,
+      repositoryPermission: permission,
+      policyVersionId: record.policy.id,
+      baseSha: record.run.baseSha,
+      githubCommentId: BigInt(input.githubCommentId)
+    }).onConflictDoNothing().returning({ id: approvals.id });
+    if (inserted.length > 0) {
+      await appendAuditEvent(this.database, {
+        pilotId: record.run.pilotId,
+        eventType: "escalation.approved_by_maintainer",
+        actorType: "maintainer",
+        actorId: input.githubUserId,
+        payload: { runId: input.runId, escalationId: record.escalation.id, version: record.escalation.version, contentHash: record.escalation.contentHash, permission }
+      });
+    }
+
+    const planEligibility = record.run.currentPlanId
+      ? await this.revalidatePlanApprovals({
+          pilotId: record.run.pilotId,
+          runId: input.runId,
+          planId: record.run.currentPlanId,
+          installationId: record.repository.installationId.toString(),
+          owner: record.repository.owner,
+          repo: record.repository.name,
+          requiredRole: policy.authorization.minimumApprovalRole
+        })
+      : { distinctEligibleApprovers: 0, invalidatedLogins: [] as string[] };
+    if (record.run.condition === "governed_orchestration" && planEligibility.distinctEligibleApprovers < policy.authorization.executionPlanQuorum) {
+      if (record.run.state !== "awaiting_plan_approval") {
+        await this.execution.transition({
+          runId: input.runId, pilotId: record.run.pilotId, condition: "governed_orchestration",
+          event: { type: "plan_quorum_lost" }, actorType: "system", actorId: "approval-service"
+        });
+      }
+      return { activeApprovals: 0, requiredApprovals: policy.authorization.escalationQuorum, quorumReached: false, invalidatedApprovals: planEligibility.invalidatedLogins };
+    }
+
+    const eligibility = await this.revalidateRequestApprovals({
+      pilotId: record.run.pilotId,
+      runId: input.runId,
+      requestType: "escalation",
+      requestId: record.escalation.id,
+      installationId: record.repository.installationId.toString(),
+      owner: record.repository.owner,
+      repo: record.repository.name,
+      requiredRole: policy.authorization.minimumApprovalRole
+    });
+    const quorumReached = eligibility.distinctEligibleApprovers >= policy.authorization.escalationQuorum;
+    let newlyApproved = false;
+    if (quorumReached) {
+      newlyApproved = await this.database.sql.begin(async (transaction) => {
+        const [locked] = await transaction<{ status: string }[]>`
+          SELECT status FROM escalations WHERE id = ${record.escalation.id}::uuid FOR UPDATE
+        `;
+        if (!locked || locked.status === "rejected") throw new Error("Escalation is not approvable");
+        if (locked.status === "approved") return false;
+        await transaction`UPDATE escalations SET status = 'approved' WHERE id = ${record.escalation.id}::uuid`;
+        await transaction`
+          UPDATE action_proposals SET status = 'authorized'
+          WHERE id = ${record.proposal.id}::uuid AND status = 'proposed'
+        `;
+        await this.execution.transitionTx(transaction, {
+          runId: input.runId,
+          pilotId: record.run.pilotId,
+          condition: record.run.condition as Condition,
+          event: { type: "escalation_quorum_reached" },
+          actorType: "system",
+          actorId: "approval-service"
+        });
+        return true;
+      });
+    }
+    if (newlyApproved) await enqueueJob(this.database, "run.execute_action", { runId: input.runId, proposalId: record.proposal.id });
+    return {
+      activeApprovals: eligibility.distinctEligibleApprovers,
+      requiredApprovals: policy.authorization.escalationQuorum,
+      quorumReached,
+      invalidatedApprovals: [...planEligibility.invalidatedLogins, ...eligibility.invalidatedLogins]
+    };
+  }
+
+  async rejectEscalation(input: { runId: string; version: number; githubUserId: string; githubLogin: string }): Promise<void> {
+    const [record] = await this.database.db
+      .select({ escalation: escalations, checkpoint: governanceCheckpoints, proposal: actionProposals, run: runs, repository: repositories, policy: repositoryPolicyVersions })
+      .from(escalations)
+      .innerJoin(governanceCheckpoints, eq(governanceCheckpoints.id, escalations.checkpointId))
+      .innerJoin(actionProposals, eq(actionProposals.id, governanceCheckpoints.actionProposalId))
+      .innerJoin(runs, eq(runs.id, escalations.runId))
+      .innerJoin(repositories, eq(repositories.id, runs.repositoryId))
+      .innerJoin(repositoryPolicyVersions, eq(repositoryPolicyVersions.id, runs.policyVersionId))
+      .where(and(eq(escalations.runId, input.runId), eq(escalations.version, input.version)));
+    if (!record) throw new Error("Escalation version not found");
+    const policy = record.policy.policyJson as RepositoryPolicy;
+    const permission = await this.github.getRepositoryPermission({ installationId: record.repository.installationId.toString(), owner: record.repository.owner, repo: record.repository.name, login: input.githubLogin });
+    if (!meetsPermission(permission, policy.authorization.minimumApprovalRole)) throw new Error("Insufficient permission to reject escalation");
+
+    await this.database.sql.begin(async (transaction) => {
+      const [changed] = await transaction<{ id: string }[]>`
+        UPDATE escalations SET status = 'rejected'
+        WHERE id = ${record.escalation.id}::uuid AND status = 'awaiting_approval'
+        RETURNING id
+      `;
+      if (!changed) throw new Error("Escalation is not awaiting approval");
+      await transaction`UPDATE action_proposals SET status = 'rejected' WHERE id = ${record.proposal.id}::uuid AND status = 'proposed'`;
+      await this.execution.transitionTx(transaction, {
+        runId: input.runId,
+        pilotId: record.run.pilotId,
+        condition: record.run.condition as Condition,
+        event: { type: "escalation_rejected" },
+        actorType: "maintainer",
+        actorId: input.githubUserId
+      });
+    });
   }
 
   /**

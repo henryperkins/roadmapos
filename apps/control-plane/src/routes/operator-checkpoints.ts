@@ -3,8 +3,13 @@ import { JudgmentClassificationObjectSchema, JudgmentClassificationSchema } from
 import { z } from "zod";
 import { requireRole } from "../auth.js";
 import type { CheckpointService } from "../services/checkpoint-service.js";
+import type { CheckpointFollowUpService } from "../services/checkpoint-followup.js";
 
-export async function registerOperatorCheckpointRoutes(app: FastifyInstance, service: CheckpointService): Promise<void> {
+export async function registerOperatorCheckpointRoutes(
+  app: FastifyInstance,
+  service: CheckpointService,
+  followUp?: CheckpointFollowUpService
+): Promise<void> {
   app.get("/internal/operator/checkpoints/:checkpointId", async (request) => {
     requireRole(request, "operator");
     const { checkpointId } = z.object({ checkpointId: z.string().uuid() }).parse(request.params);
@@ -16,7 +21,9 @@ export async function registerOperatorCheckpointRoutes(app: FastifyInstance, ser
     const { checkpointId } = z.object({ checkpointId: z.string().uuid() }).parse(request.params);
     const { rationale, ...fields } = JudgmentClassificationObjectSchema.extend({ rationale: z.string().min(1) }).parse(request.body);
     const classification = JudgmentClassificationSchema.parse(fields);
-    const result = await service.recordOperatorClassification({ checkpointId, classification, rationale, operatorId: "operator" });
+    const operatorId = "operator";
+    const result = await service.recordOperatorClassification({ checkpointId, classification, rationale, operatorId });
+    await followUp?.dispatch(checkpointId, result, operatorId);
     return reply.code(201).send(result);
   });
 }

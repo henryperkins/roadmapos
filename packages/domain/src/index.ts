@@ -2,6 +2,7 @@ export * from "./canonical-json.js";
 export * from "./hash.js";
 export * from "./enums.js";
 export * from "./schemas.js";
+export * from "./delivery-artifacts.js";
 export * from "./run-events.js";
 export * from "./run-reducer.js";
 export * from "./secret-box.js";
