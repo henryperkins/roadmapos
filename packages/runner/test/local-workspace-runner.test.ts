@@ -8,13 +8,17 @@ const TOKEN = "ghs_fixture_installation_token_value";
 
 class FakeDockerExecutor extends DockerCommandExecutor {
   readonly invocations: Array<{ root: string; argv: string[]; timeoutSeconds: number }> = [];
+  /** What the container would actually have seen, captured before the snapshot is destroyed. */
+  readonly snapshotContents: string[][] = [];
 
   constructor() {
-    super("node:22-bookworm");
+    super("node:22-bookworm@sha256:0000000000000000000000000000000000000000000000000000000000000000");
   }
 
-  override async run(workspaceRoot: string, argv: string[], timeoutSeconds: number): Promise<ProcessResult> {
-    this.invocations.push({ root: workspaceRoot, argv, timeoutSeconds });
+  override async run(snapshotRoot: string, argv: string[], timeoutSeconds: number): Promise<ProcessResult> {
+    this.invocations.push({ root: snapshotRoot, argv, timeoutSeconds });
+    const listing = await runProcess({ executable: "find", args: [snapshotRoot, "-maxdepth", "2"], timeoutMs: 10_000 });
+    this.snapshotContents.push(listing.stdout.split("\n").map((line) => line.replace(`${snapshotRoot}/`, "")));
     return { exitCode: 0, stdout: "ok", stderr: "", durationMs: 1 };
   }
 }
@@ -151,5 +155,60 @@ describe("LocalWorkspaceRunner", () => {
 
   it("refuses an empty validation argv", async () => {
     await expect(new DockerCommandExecutor("node:22-bookworm").run(workspaceRoot, [], 1)).rejects.toThrow("Validation argv cannot be empty");
+  });
+});
+
+describe("validation isolation and privileged Git guards", () => {
+  it("runs validation on a source-only snapshot that has no .git", async () => {
+    const runner = new LocalWorkspaceRunner(workspaceRoot, docker);
+    const handle = await runner.prepare(request());
+    await runner.runValidation(handle, "unit");
+
+    const invocation = docker.invocations[0];
+    expect(invocation).toBeDefined();
+    expect(invocation?.root).not.toBe(handle.root);
+    expect(docker.snapshotContents[0]).toContain("src/a.ts");
+    expect(docker.snapshotContents[0]).not.toContain(".git");
+  });
+
+  it("destroys the validation snapshot even when the command mutates it", async () => {
+    const runner = new LocalWorkspaceRunner(workspaceRoot, docker);
+    const handle = await runner.prepare(request());
+    await runner.runValidation(handle, "unit");
+    const snapshotRoot = docker.invocations[0]?.root;
+    expect(snapshotRoot).toBeDefined();
+    await expect(readFile(join(String(snapshotRoot), "src", "a.ts"), "utf8")).rejects.toThrow();
+  });
+
+  it("refuses to push when origin has been repointed at another remote", async () => {
+    const runner = new LocalWorkspaceRunner(workspaceRoot, docker);
+    const handle = await runner.prepare(request());
+    await runner.applyPatch(handle, PATCH);
+    const attacker = join(scratch, "attacker.git");
+    await runProcess({ executable: "git", args: ["init", "--bare", attacker], timeoutMs: 30_000 });
+    await git(handle.root, "remote", "set-url", "origin", attacker);
+
+    await expect(runner.commitAndPush(handle, "Update a", TOKEN))
+      .rejects.toThrow("origin no longer points at the authorized repository");
+  });
+
+  it("refuses to push when the branch has been switched under it", async () => {
+    const runner = new LocalWorkspaceRunner(workspaceRoot, docker);
+    const handle = await runner.prepare(request());
+    await runner.applyPatch(handle, PATCH);
+    await git(handle.root, "switch", "-c", "roadmapos/not-authorized");
+
+    await expect(runner.commitAndPush(handle, "Update a", TOKEN))
+      .rejects.toThrow("Workspace branch is roadmapos/not-authorized");
+  });
+
+  it("refuses a privileged Git operation on a workspace this process never prepared", async () => {
+    const prepared = new LocalWorkspaceRunner(workspaceRoot, docker);
+    const handle = await prepared.prepare(request());
+    await prepared.applyPatch(handle, PATCH);
+
+    const restarted = new LocalWorkspaceRunner(workspaceRoot, docker);
+    await expect(restarted.commitAndPush(handle, "Update a", TOKEN))
+      .rejects.toThrow("refusing a privileged Git operation");
   });
 });

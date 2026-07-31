@@ -1,12 +1,13 @@
 import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { sha256Text } from "@roadmapos/domain";
 import { affectedPathsFromPatch } from "./patch.js";
 import { runProcess } from "./process.js";
 import { assertReadablePath } from "./safe-path.js";
 import type { CommitResult, PatchResult, ReadonlyFile, ValidationResult, WorkspaceHandle, WorkspaceRequest, WorkspaceRunner } from "./types.js";
 import type { DockerCommandExecutor } from "./docker-executor.js";
+import { assertGitStateAuthorized, readGitState } from "./workspace-guard.js";
 
 /**
  * Hands git a token through a single-use askpass helper. The token never reaches argv, a remote
@@ -24,6 +25,15 @@ async function withGitCredential<T>(token: string, operation: (env: NodeJS.Proce
   }
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function directoryExists(path: string): Promise<boolean> {
   try {
     return (await lstat(path)).isDirectory();
@@ -33,6 +43,9 @@ async function directoryExists(path: string): Promise<boolean> {
 }
 
 export class LocalWorkspaceRunner implements WorkspaceRunner {
+  /** Set by prepare(), so a later privileged Git operation can re-verify what it was authorized on. */
+  private readonly expectations = new Map<string, { cloneUrl: string; baseSha: string; branchName: string }>();
+
   constructor(private readonly root: string, private readonly docker: DockerCommandExecutor) {}
 
   async prepare(input: WorkspaceRequest): Promise<WorkspaceHandle> {
@@ -52,6 +65,7 @@ export class LocalWorkspaceRunner implements WorkspaceRunner {
       const branch = await runProcess({ executable: "git", args: ["rev-parse", "--abbrev-ref", "HEAD"], cwd: workspace, timeoutMs: 10_000 });
       const ancestry = await runProcess({ executable: "git", args: ["merge-base", "--is-ancestor", input.baseSha, "HEAD"], cwd: workspace, timeoutMs: 10_000 });
       if (branch.exitCode === 0 && branch.stdout.trim() === input.branchName && ancestry.exitCode === 0) {
+        this.expectations.set(input.runId, { cloneUrl: input.cloneUrl, baseSha: input.baseSha, branchName: input.branchName });
         return handle;
       }
       throw new Error(
@@ -70,6 +84,7 @@ export class LocalWorkspaceRunner implements WorkspaceRunner {
     if (branch.exitCode !== 0) throw new Error(`git branch failed: ${branch.stderr}`);
     await runProcess({ executable: "git", args: ["config", "user.name", "RoadmapOS Bot"], cwd: workspace, timeoutMs: 10_000 });
     await runProcess({ executable: "git", args: ["config", "user.email", "roadmapos-bot@users.noreply.github.com"], cwd: workspace, timeoutMs: 10_000 });
+    this.expectations.set(input.runId, { cloneUrl: input.cloneUrl, baseSha: input.baseSha, branchName: input.branchName });
     return handle;
   }
 
@@ -105,21 +120,60 @@ export class LocalWorkspaceRunner implements WorkspaceRunner {
     }
   }
 
+  /**
+   * Validation runs on a disposable source-only snapshot. `git worktree`/`checkout-index` writes
+   * the tracked content without `.git`, so repository-controlled build and test code cannot reach
+   * the remote configuration, refs or index that the later token-bearing push depends on. The
+   * snapshot is destroyed afterwards whatever the command did to it.
+   */
   async runValidation(handle: WorkspaceHandle, commandId: string): Promise<ValidationResult> {
     const command = handle.validationCommands.find((candidate) => candidate.id === commandId);
     if (!command) throw new Error(`Unknown validation command ID: ${commandId}`);
-    const result = await this.docker.run(handle.root, command.argv, command.timeoutSeconds);
-    return { commandId, ...result };
+    const snapshot = await mkdtemp(join(tmpdir(), "roadmapos-validate-"));
+    try {
+      const exported = await runProcess({
+        executable: "git",
+        args: ["checkout-index", "--all", "--force", `--prefix=${snapshot}${sep}`],
+        cwd: handle.root,
+        timeoutMs: 120_000
+      });
+      if (exported.exitCode !== 0) throw new Error(`Unable to export a validation snapshot: ${exported.stderr}`);
+      if (await pathExists(join(snapshot, ".git"))) throw new Error("Validation snapshot unexpectedly contains .git");
+      const result = await this.docker.run(snapshot, command.argv, command.timeoutSeconds);
+      return { commandId, ...result };
+    } finally {
+      await rm(snapshot, { recursive: true, force: true });
+    }
   }
 
   async commitAndPush(handle: WorkspaceHandle, message: string, installationToken: string): Promise<CommitResult> {
-    const commit = await runProcess({ executable: "git", args: ["commit", "-m", message], cwd: handle.root, timeoutMs: 60_000 });
+    const expectation = this.expectations.get(handle.runId);
+    if (!expectation) throw new Error("Workspace was not prepared in this process; refusing a privileged Git operation");
+    // Re-establish, immediately before the token is used, that this is still the authorized
+    // checkout: same real path, same origin, same branch, still descended from the base SHA.
+    const facts = await assertGitStateAuthorized({
+      root: handle.root,
+      branchName: expectation.branchName,
+      baseSha: expectation.baseSha,
+      cloneUrl: expectation.cloneUrl
+    });
+    const commit = await runProcess({ executable: "git", args: ["commit", "-m", message], cwd: facts.realRoot, timeoutMs: 60_000 });
     if (commit.exitCode !== 0) throw new Error(`git commit failed: ${commit.stderr}`);
-    const sha = await runProcess({ executable: "git", args: ["rev-parse", "HEAD"], cwd: handle.root, timeoutMs: 10_000 });
+    const after = await readGitState({ root: facts.realRoot, branchName: expectation.branchName, baseSha: expectation.baseSha, cloneUrl: expectation.cloneUrl });
+    if (after.originUrl !== expectation.cloneUrl) throw new Error("Workspace origin changed during the commit");
     await withGitCredential(installationToken, async (env) => {
-      const push = await runProcess({ executable: "git", args: ["push", "--set-upstream", "origin", handle.branchName], cwd: handle.root, env, timeoutMs: 120_000, redactions: [installationToken] });
+      // The push target and refspec are constructed by the host from the authorized values, never
+      // read back from whatever `origin` currently happens to be.
+      const push = await runProcess({
+        executable: "git",
+        args: ["push", "--set-upstream", expectation.cloneUrl, `refs/heads/${expectation.branchName}:refs/heads/${expectation.branchName}`],
+        cwd: facts.realRoot,
+        env,
+        timeoutMs: 120_000,
+        redactions: [installationToken]
+      });
       if (push.exitCode !== 0) throw new Error(`git push failed: ${push.stderr}`);
     });
-    return { commitSha: sha.stdout.trim(), branchName: handle.branchName };
+    return { commitSha: after.head, branchName: expectation.branchName };
   }
 }
