@@ -9,10 +9,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "next": "^16.2.12",
+    "next": "^16.4.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "zod": "^3.25.76"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.0",

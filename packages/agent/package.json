@@ -13,6 +13,6 @@
   "dependencies": {
     "@openai/agents": "^0.2.1",
     "@roadmapos/domain": "workspace:*",
-    "zod": "^3.25.76"
+    "zod": "^4.6.6"
   }
 }
